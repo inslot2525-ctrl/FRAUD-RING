@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 
 DATA_PATH = "data/raw/paysim/paysim.csv"
-SEQ_LEN = 20
+SEQ_LEN = 2
 
 
 def encode_tx_type(tx_type):
@@ -35,10 +35,12 @@ def main():
 
         seq = group[["amount", "type_encoded", "step"]].values
 
-        if len(seq) < SEQ_LEN:
-            continue
-
-        seq = seq[:SEQ_LEN]
+    if len(seq) < SEQ_LEN:
+        
+      padding = np.zeros((SEQ_LEN - len(seq), 3))
+      seq = np.vstack([seq, padding])
+    else:
+        seq = seq[:SEQ_LEN]                            
 
         label = int(group["isFraud"].max())
 

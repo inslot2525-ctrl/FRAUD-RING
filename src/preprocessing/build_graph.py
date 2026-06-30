@@ -1,15 +1,22 @@
 import pandas as pd
 import networkx as nx
 import os
+import pickle
 
-# Resolve path relative to script directory to make it robust to where the script is run from
+# Resolve path relative to script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.abspath(os.path.join(SCRIPT_DIR, "../../data/raw/paysim/paysim.csv"))
+DATA_PATH = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "../../data/raw/paysim/paysim.csv")
+)
+
+GRAPH_SAVE_PATH = os.path.abspath(
+    os.path.join(SCRIPT_DIR, "../../data/processed/graph.pkl")
+)
 
 
 def load_data():
     print("Loading PaySim dataset...")
-    df = pd.read_csv(DATA_PATH, nrows=100000)   # sample first
+    df = pd.read_csv(DATA_PATH, nrows=100000)
     return df
 
 
@@ -22,7 +29,7 @@ def inspect(df):
 
 def build_transaction_graph(df):
     print("\nBuilding graph...")
-    
+
     G = nx.DiGraph()
 
     for _, row in df.iterrows():
@@ -49,12 +56,22 @@ def graph_stats(G):
     print("Edges:", G.number_of_edges())
 
 
+def save_graph(G):
+    os.makedirs(os.path.dirname(GRAPH_SAVE_PATH), exist_ok=True)
+
+    with open(GRAPH_SAVE_PATH, "wb") as f:
+        pickle.dump(G, f)
+
+    print(f"\nGraph saved to: {GRAPH_SAVE_PATH}")
+
+
 def main():
     df = load_data()
     inspect(df)
 
     G = build_transaction_graph(df)
     graph_stats(G)
+    save_graph(G)
 
 
 if __name__ == "__main__":
