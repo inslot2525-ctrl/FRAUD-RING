@@ -16,7 +16,7 @@ def extract_embeddings():
     print(f"Using Device: {device}")
 
     print("Loading graph data...")
-    data = torch.load(PYG_GRAPH_PATH).to(device)
+    data = torch.load(PYG_GRAPH_PATH, weights_only=False).to(device)
 
     print("Loading trained FraudGNN model...")
     # Initialize the architecture
@@ -24,7 +24,7 @@ def extract_embeddings():
     
     # Load the weights you are currently training!
     try:
-        model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device))
+        model.load_state_dict(torch.load(MODEL_SAVE_PATH, map_location=device, weights_only=True))
         print("✅ Model weights loaded successfully.")
     except FileNotFoundError:
         print(f"❌ Error: Could not find {MODEL_SAVE_PATH}. Wait for training to finish!")

@@ -20,7 +20,7 @@ def find_fraud_rings():
         print("❌ Error: Run extract_gnn_embeddings.py first!")
         return
 
-    data = torch.load(PYG_GRAPH_PATH)
+    data = torch.load(PYG_GRAPH_PATH, weights_only=False)
     with open(NODE_MAPPING_PATH, 'rb') as f:
         node_mapping = pickle.load(f)
     
