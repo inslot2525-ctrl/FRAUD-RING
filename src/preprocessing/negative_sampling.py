@@ -1,100 +1,62 @@
-"""
-negative_sampling.py
---------------------
-Generates negative (non-existent) edges for link-prediction training.
-
-Strategy
---------
-For each positive (fraud) edge we sample `neg_ratio` random edges that do
-NOT exist in the graph.  This keeps the negative set proportional and avoids
-trivially easy negatives.
-
-Outputs
--------
-data/processed/neg_edge_index.pt  – LongTensor [2, N_neg]
-"""
-
 import os
-import pickle
-
 import torch
+import time
 
+# Resolve paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROCESSED_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../data/processed"))
+PYG_GRAPH_PATH = os.path.join(PROCESSED_DIR, "pyg_graph.pt")
 
-
-def load_edge_index(processed_dir: str) -> torch.Tensor:
-    path = os.path.join(processed_dir, "edge_index.pt")
-    edge_index = torch.load(path, weights_only=True)
-    return edge_index
-
-
-def sample_negatives(
-    edge_index: torch.Tensor,
-    num_nodes: int,
-    neg_ratio: float = 1.0,
-    seed: int = 42,
-) -> torch.Tensor:
-    """
-    Parameters
-    ----------
-    edge_index : LongTensor [2, E]  – existing (positive) edges
-    num_nodes  : total number of nodes in the graph
-    neg_ratio  : negatives per positive edge
-    seed       : RNG seed for reproducibility
-
-    Returns
-    -------
-    neg_edge_index : LongTensor [2, N_neg]
-    """
-    torch.manual_seed(seed)
-
-    # Build a set of existing edges for O(1) lookup
-    existing = set(
-        zip(edge_index[0].tolist(), edge_index[1].tolist())
-    )
-
-    num_pos = edge_index.size(1)
-    num_neg = int(num_pos * neg_ratio)
-
-    src_neg, dst_neg = [], []
-    attempts = 0
-    max_attempts = num_neg * 20  # safety cap
-
-    while len(src_neg) < num_neg and attempts < max_attempts:
-        attempts += 1
-        s = torch.randint(0, num_nodes, (1,)).item()
-        d = torch.randint(0, num_nodes, (1,)).item()
-        if s != d and (s, d) not in existing:
-            src_neg.append(s)
-            dst_neg.append(d)
-            existing.add((s, d))  # avoid duplicates within negatives
-
-    sampled = len(src_neg)
-    if sampled < num_neg:
-        print(f"  Warning: only sampled {sampled}/{num_neg} negatives "
-              f"after {attempts} attempts.")
-
-    neg_edge_index = torch.tensor([src_neg, dst_neg], dtype=torch.long)
-    print(f"  Sampled {neg_edge_index.size(1):,} negative edges "
-          f"(ratio={neg_ratio})")
-    return neg_edge_index
-
-
-def main() -> None:
-    print("Loading edge index...")
-    edge_index = load_edge_index(PROCESSED_DIR)
-
-    # Number of nodes = max index + 1
-    num_nodes = int(edge_index.max().item()) + 1
-    print(f"  Nodes: {num_nodes:,} | Positive edges: {edge_index.size(1):,}")
-
-    neg_edge_index = sample_negatives(edge_index, num_nodes, neg_ratio=1.0)
-
-    out_path = os.path.join(PROCESSED_DIR, "neg_edge_index.pt")
-    torch.save(neg_edge_index, out_path)
-    print(f"Saved: {out_path}")
-
+def balance_training_edges():
+    print("Loading split PyG graph...")
+    start_time = time.time()
+    
+    data = torch.load(PYG_GRAPH_PATH, weights_only=False)
+    
+    # Extract training mask and fraud labels
+    train_mask = data.train_edge_mask
+    is_fraud = data.edge_attr[:, 3].bool()
+    
+    # 1. Find indices of all Train Fraud and Train Normal edges
+    train_fraud_indices = torch.where(train_mask & is_fraud)[0]
+    train_normal_indices = torch.where(train_mask & ~is_fraud)[0]
+    
+    num_fraud = train_fraud_indices.size(0)
+    
+    # 2. Sample Normal edges at a 1:10 ratio
+    ratio = 10
+    num_normal_to_sample = num_fraud * ratio
+    
+    print(f"Found {num_fraud:,} Fraud edges in training.")
+    print(f"Sampling {num_normal_to_sample:,} Normal edges (1:{ratio} ratio)...")
+    
+    # Randomly shuffle and select
+    perm = torch.randperm(train_normal_indices.size(0))
+    sampled_normal_indices = train_normal_indices[perm[:num_normal_to_sample]]
+    
+    # 3. Combine them to create our Training Supervision Set
+    supervision_indices = torch.cat([train_fraud_indices, sampled_normal_indices])
+    
+    # Shuffle the final combined list so fraud/normal are mixed during training
+    supervision_indices = supervision_indices[torch.randperm(supervision_indices.size(0))]
+    
+    # 4. Save indices directly into the PyG Data object
+    data.train_supervision_indices = supervision_indices
+    
+    # For Val and Test, we grade the model on EVERYTHING in that time period
+    data.val_supervision_indices = torch.where(data.val_edge_mask)[0]
+    data.test_supervision_indices = torch.where(data.test_edge_mask)[0]
+    
+    print("\nSupervision Sets Created:")
+    print(f"  - Train: {data.train_supervision_indices.size(0):,} edges used for loss")
+    print(f"  - Val:   {data.val_supervision_indices.size(0):,} edges used for evaluation")
+    print(f"  - Test:  {data.test_supervision_indices.size(0):,} edges used for evaluation")
+    
+    # Save the updated graph
+    torch.save(data, PYG_GRAPH_PATH)
+    
+    elapsed = time.time() - start_time
+    print(f"\n✅ Negative Sampling Complete in {elapsed:.2f} seconds!")
 
 if __name__ == "__main__":
-    main()
+    balance_training_edges()

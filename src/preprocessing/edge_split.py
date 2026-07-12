@@ -12,7 +12,7 @@ def split_edges_chronologically():
     start_time = time.time()
     
     # Load the unified graph
-    data = torch.load(PYG_GRAPH_PATH)
+    data = torch.load(PYG_GRAPH_PATH, weights_only=False)
     
     # Extract the 'step' feature (Time hour) - it is at index 1 in edge_attr
     # edge_attr layout: [amount, step, tx_type, is_fraud, is_flagged_fraud]
