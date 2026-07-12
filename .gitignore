@@ -162,3 +162,12 @@ cython_debug/
 *.tar.gz
 *.tgz
 *.rar
+
+# PyTorch / NumPy binaries
+*.pt
+*.pth
+*.npy
+*.npz
+
+# Processed data directory
+data/processed/

@@ -1,100 +1,109 @@
+"""
+node_features.py
+----------------
+Builds a node feature matrix aligned with the integer node IDs produced by
+node_mapping.py.
+
+Features computed per node (all vectorised with torch scatter ops):
+  0  out_degree      – number of transactions sent
+  1  in_degree       – number of transactions received
+  2  amount_sent     – total amount sent
+  3  amount_received – total amount received
+  4  fraud_sent      – number of outgoing fraud transactions
+  5  fraud_received  – number of incoming fraud transactions
+
+All features are z-score normalised before saving.
+
+Output
+------
+data/processed/x_node_features.pt  – FloatTensor [N, 6]
+"""
+
+import json
 import os
-import pandas as pd
-import networkx as nx
+import time
 
-DATA_PATH = "data/raw/paysim/paysim.csv"
+import torch
 
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+SCRIPT_DIR    = os.path.dirname(os.path.abspath(__file__))
+PROCESSED_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "../../data/processed"))
 
-def load_data():
-    print("Loading dataset...")
-    df = pd.read_csv(DATA_PATH, nrows=100000)  # sample for now
-    return df
-
-
-def build_graph(df):
-    print("Building graph...")
-    G = nx.DiGraph()
-
-    for _, row in df.iterrows():
-        sender = row["nameOrig"]
-        receiver = row["nameDest"]
-
-        G.add_edge(
-            sender,
-            receiver,
-            amount=row["amount"],
-            fraud=row["isFraud"]
-        )
-
-    return G
+EDGE_INDEX_PATH = os.path.join(PROCESSED_DIR, "edge_index.pt")
+EDGE_ATTR_PATH  = os.path.join(PROCESSED_DIR, "edge_attr.pt")
+STATS_PATH      = os.path.join(PROCESSED_DIR, "graph_stats.json")
+NODE_FEAT_PATH  = os.path.join(PROCESSED_DIR, "x_node_features.pt")
 
 
-def compute_node_features(G):
-    features = []
+def compute_node_features() -> None:
+    start = time.time()
 
-    for node in G.nodes():
-        in_degree = G.in_degree(node)
-        out_degree = G.out_degree(node)
+    # ------------------------------------------------------------------
+    # Load tensors
+    # ------------------------------------------------------------------
+    print("Loading graph tensors...")
+    with open(STATS_PATH, "r") as f:
+        stats = json.load(f)
+    num_nodes = stats["num_nodes"]
 
-        incoming_edges = list(G.in_edges(node, data=True))
-        outgoing_edges = list(G.out_edges(node, data=True))
+    edge_index = torch.load(EDGE_INDEX_PATH, weights_only=True)  # [2, E]
+    edge_attr  = torch.load(EDGE_ATTR_PATH,  weights_only=True)  # [E, 5]
 
-        total_received = sum(data["amount"] for _, _, data in incoming_edges)
-        total_sent = sum(data["amount"] for _, _, data in outgoing_edges)
+    src     = edge_index[0]       # sender   indices  [E]
+    dst     = edge_index[1]       # receiver indices  [E]
+    amounts = edge_attr[:, 0]     # transaction amount
+    fraud   = edge_attr[:, 3]     # isFraud flag  (0 or 1)
 
-        avg_received = total_received / in_degree if in_degree > 0 else 0
-        avg_sent = total_sent / out_degree if out_degree > 0 else 0
+    print(f"Nodes: {num_nodes:,} | Edges: {src.size(0):,}")
 
-        fraud_count = 0
+    # ------------------------------------------------------------------
+    # Feature engineering  (fully vectorised — no Python loops)
+    # ------------------------------------------------------------------
+    print("Engineering features...")
 
-        for _, _, data in incoming_edges:
-            fraud_count += data["fraud"]
+    x = torch.zeros((num_nodes, 6), dtype=torch.float32)
 
-        for _, _, data in outgoing_edges:
-            fraud_count += data["fraud"]
+    # Degrees
+    x[:, 0] = torch.bincount(src, minlength=num_nodes).float()   # out_degree
+    x[:, 1] = torch.bincount(dst, minlength=num_nodes).float()   # in_degree
 
-        total_edges = in_degree + out_degree
-        fraud_ratio = fraud_count / total_edges if total_edges > 0 else 0
+    # Amount totals
+    x[:, 2].scatter_add_(0, src, amounts)   # amount_sent
+    x[:, 3].scatter_add_(0, dst, amounts)   # amount_received
 
-        features.append([
-            node,
-            in_degree,
-            out_degree,
-            total_sent,
-            total_received,
-            avg_sent,
-            avg_received,
-            fraud_count,
-            fraud_ratio
-        ])
+    # Fraud counts
+    x[:, 4].scatter_add_(0, src, fraud)     # fraud_sent
+    x[:, 5].scatter_add_(0, dst, fraud)     # fraud_received
 
-    feature_df = pd.DataFrame(features, columns=[
-        "account",
-        "in_degree",
-        "out_degree",
-        "total_sent",
-        "total_received",
-        "avg_sent",
-        "avg_received",
-        "fraud_count",
-        "fraud_ratio"
-    ])
+    # ------------------------------------------------------------------
+    # Z-score normalisation
+    # ------------------------------------------------------------------
+    print("Normalising features...")
+    mean = x.mean(dim=0)
+    std  = x.std(dim=0).clamp(min=1e-6)
+    x    = (x - mean) / std
 
-    return feature_df
+    # ------------------------------------------------------------------
+    # Save
+    # ------------------------------------------------------------------
+    torch.save(x, NODE_FEAT_PATH)
 
+    elapsed = time.time() - start
+    print(f"\n✅ Stage 2 complete in {elapsed:.2f}s")
+    print(f"  x_node_features.pt  shape: {list(x.shape)}")
+    print(f"  Saved to: {NODE_FEAT_PATH}")
 
-def main():
-    df = load_data()
-    G = build_graph(df)
-    feature_df = compute_node_features(G)
-
-    os.makedirs("data/processed", exist_ok=True)
-    feature_df.to_csv("data/processed/node_features.csv", index=False)
-
-    print(feature_df.head())
-    print("\nShape:", feature_df.shape)
-    print("Saved node features.")
+    # Quick sanity check
+    print(f"\nFeature stats (post-normalisation):")
+    labels = ["out_degree", "in_degree", "amount_sent", "amount_received",
+              "fraud_sent", "fraud_received"]
+    for i, name in enumerate(labels):
+        col = x[:, i]
+        print(f"  {name:18s}  mean={col.mean():.4f}  std={col.std():.4f}"
+              f"  max={col.max():.2f}")
 
 
 if __name__ == "__main__":
-    main()
+    compute_node_features()
