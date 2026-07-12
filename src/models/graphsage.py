@@ -1,57 +1,96 @@
-"""
-graphsage.py
-------------
-GraphSAGE encoder that produces node embeddings.
-
-The encoder is kept separate from any task-specific head so the same
-backbone can be reused by the edge decoder, the anomaly detector, etc.
-"""
-
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import SAGEConv
 
-
-class GraphSAGEEncoder(torch.nn.Module):
+class GraphSAGEEncoder(nn.Module):
     """
-    Two-layer GraphSAGE encoder.
-
-    Parameters
-    ----------
-    input_dim     : number of input node features
-    hidden_dim    : width of the first SAGE layer
-    embedding_dim : output embedding size (per node)
-    dropout       : dropout probability applied between layers
+    2-Layer GraphSAGE Encoder.
+    Aggregates neighborhood features to create 64-dimensional node embeddings.
     """
-
-    def __init__(
-        self,
-        input_dim: int,
-        hidden_dim: int = 64,
-        embedding_dim: int = 32,
-        dropout: float = 0.3,
-    ):
-        super().__init__()
+    def __init__(self, in_channels=6, hidden_channels=64, out_channels=64, dropout=0.2):
+        super(GraphSAGEEncoder, self).__init__()
+        
+        # Layer 1: Aggregates immediate neighbors (1-hop)
+        # 'mean' aggregation computes the average feature vector of neighbors
+        self.conv1 = SAGEConv(in_channels, hidden_channels, aggr='mean')
+        
+        # Layer 2: Aggregates neighbors of neighbors (2-hop fraud chains)
+        self.conv2 = SAGEConv(hidden_channels, out_channels, aggr='mean')
+        
         self.dropout = dropout
 
-        self.conv1 = SAGEConv(input_dim, hidden_dim)
-        self.conv2 = SAGEConv(hidden_dim, embedding_dim)
-
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x          : FloatTensor [N, input_dim]
-        edge_index : LongTensor  [2, E]
-
-        Returns
-        -------
-        embeddings : FloatTensor [N, embedding_dim]
-        """
+    def forward(self, x, edge_index):
+        # First Message Passing Layer
         x = self.conv1(x, edge_index)
         x = F.relu(x)
         x = F.dropout(x, p=self.dropout, training=self.training)
-
+        
+        # Second Message Passing Layer
         x = self.conv2(x, edge_index)
-        # No activation here — the edge decoder or downstream task decides
+        # Note: No activation on the final embedding layer
         return x
+
+
+class EdgeDecoder(nn.Module):
+    """
+    Takes sender and receiver node embeddings, combines them, 
+    and classifies whether the edge (transaction) is fraudulent.
+    """
+    def __init__(self, embedding_dim=64, hidden_dim=32):
+        super(EdgeDecoder, self).__init__()
+        
+        # Because we concatenate [sender_embed, receiver_embed], input dim is 2 * embedding_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(embedding_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(hidden_dim, 1)  # Outputs a single logit (unnormalized score)
+        )
+
+    def forward(self, z, edge_label_index):
+        """
+        Args:
+            z: Node embeddings tensor of shape [num_nodes, embedding_dim]
+            edge_label_index: Tensor of shape [2, num_edges_to_predict] containing (src, dst) pairs
+        """
+        src_indices = edge_label_index[0]
+        dst_indices = edge_label_index[1]
+        
+        # Extract embeddings for senders and receivers
+        z_src = z[src_indices]  # Shape: [num_edges, embedding_dim]
+        z_dst = z[dst_indices]  # Shape: [num_edges, embedding_dim]
+        
+        # Concatenate sender and receiver embeddings
+        # Why concat? Because transaction direction matters in fraud (Sender -> Receiver)
+        edge_features = torch.cat([z_src, z_dst], dim=-1)  # Shape: [num_edges, 2 * embedding_dim]
+        
+        # Pass through MLP to get logits
+        out = self.mlp(edge_features)
+        return out.squeeze(-1)  # Shape: [num_edges]
+
+
+class FraudGNN(nn.Module):
+    """
+    Unified container wrapping the GraphSAGE Encoder and Edge Decoder.
+    """
+    def __init__(self, num_node_features=6, hidden_dim=64, embedding_dim=64):
+        super(FraudGNN, self).__init__()
+        self.encoder = GraphSAGEEncoder(in_channels=num_node_features, 
+                                        hidden_channels=hidden_dim, 
+                                        out_channels=embedding_dim)
+        self.decoder = EdgeDecoder(embedding_dim=embedding_dim, 
+                                   hidden_dim=hidden_dim // 2)
+
+    def forward(self, x, edge_index, supervision_edge_index):
+        """
+        Full forward pass:
+        1. Perform message passing over all edges in the graph to get node embeddings.
+        2. Decode only the specific edges we want to predict (supervision set).
+        """
+        # Step 1: Encode nodes using the entire network topology
+        z = self.encoder(x, edge_index)
+        
+        # Step 2: Decode the specific edges requested
+        logits = self.decoder(z, supervision_edge_index)
+        return logits
