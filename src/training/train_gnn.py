@@ -39,14 +39,14 @@ def train():
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     print(f"Class balance — fraud: {n_pos:.0f} | normal: {n_neg:.0f} | pos_weight: {pos_weight.item():.2f}")
 
-    epochs = 15
+    epochs = 30
     best_val_pr_auc = 0.0
     patience = 5          # stop if no improvement for this many epochs
     patience_counter = 0
 
     print("\nStarting Training...")
     print("=" * 60)
-    print(f"{'Epoch':<6} | {'Train Loss':<12} | {'Val ROC-AUC':<15} | {'Val PR-AUC':<15}")
+    print(f"{'Epoch':<6} | {'Train Loss':<12} | {'Val ROC-AUC':<13} | {'Val PR-AUC':<13} | {'Time':>6}")
     print("-" * 60)
 
     for epoch in range(1, epochs + 1):
@@ -94,7 +94,7 @@ def train():
         else:
             patience_counter += 1
             
-        print(f"{epoch:<6} | {loss.item():<12.4f} | {val_roc_auc:<15.4f} | {val_pr_auc:<15.4f} {saved_marker}")
+        print(f"{epoch:<6} | {loss.item():<12.4f} | {val_roc_auc:<13.4f} | {val_pr_auc:<13.4f} | {elapsed:>5.1f}s {saved_marker}")
 
         if patience_counter >= patience:
             print(f"\nEarly stopping triggered (no improvement for {patience} epochs).")
