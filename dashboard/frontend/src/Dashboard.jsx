@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import React, { useState, useEffect } from 'react'
 import { Shield, Users, AlertTriangle, Search, Loader2 } from 'lucide-react'
 import AnoAI from './AnoAI'
 import FraudNetworkGraph from './FraudNetworkGraph'
@@ -180,13 +180,17 @@ export default function Dashboard() {
           {/* Network graph */}
           <div className="col-span-2 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6 mt-0">
             <h2 className="text-xl font-medium mb-2">Network Topology</h2>
-            <p className="text-gray-500 text-xs mb-3">Top 5 fraud rings — red hubs, orange fraudsters, cyan mules</p>
+            <p className="text-gray-500 text-xs mb-3">
+              {investigation 
+                ? `Showing topology for investigated node: ${searchQuery}` 
+                : "Investigate a suspicious node ID below to render its hidden network topology."}
+            </p>
             <div className="rounded-xl overflow-hidden">
-              <FraudNetworkGraph rings={rings} width={680} height={320} />
+              <FraudNetworkGraph graphData={investigation?.graph_data} />
             </div>
           </div>
 
-          {/* Investigate */}
+          {/* Investigate Pane */}
           <div className="col-span-1 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
             <h2 className="text-xl font-medium mb-4">Investigate Node</h2>
             <form onSubmit={handleSearch} className="mb-4">
