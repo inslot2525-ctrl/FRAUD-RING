@@ -1,5 +1,7 @@
 import { useState, useEffect } from 'react'
 import { Shield, Users, AlertTriangle, Search, Loader2 } from 'lucide-react'
+import AnoAI from './AnoAI'
+import FraudNetworkGraph from './FraudNetworkGraph'
 
 const API = 'http://localhost:8000'
 
@@ -130,7 +132,13 @@ export default function Dashboard() {
 
   return (
     <div className="relative min-h-screen text-white font-sans bg-black">
-      <div className="relative z-10 p-8 min-h-screen bg-gradient-to-br from-black via-gray-950 to-black">
+
+      {/* AnoAI Three.js aurora background */}
+      <div className="absolute inset-0 z-0">
+        <AnoAI />
+      </div>
+
+      <div className="relative z-10 p-8 min-h-screen bg-black/30 backdrop-blur-sm">
 
         {/* API error banner */}
         {apiError && (
@@ -167,6 +175,15 @@ export default function Dashboard() {
           <div className="col-span-2 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
             <h2 className="text-xl font-medium mb-4">Critical Threat Networks</h2>
             <RingsTable rings={rings} loading={ringsLoading} />
+          </div>
+
+          {/* Network graph */}
+          <div className="col-span-2 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6 mt-0">
+            <h2 className="text-xl font-medium mb-2">Network Topology</h2>
+            <p className="text-gray-500 text-xs mb-3">Top 5 fraud rings — red hubs, orange fraudsters, cyan mules</p>
+            <div className="rounded-xl overflow-hidden">
+              <FraudNetworkGraph rings={rings} width={680} height={320} />
+            </div>
           </div>
 
           {/* Investigate */}
