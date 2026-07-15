@@ -1,9 +1,42 @@
-from fastapi import FastAPI, HTTPException, Query
+"""
+api/main.py
+-----------
+FastAPI backend for the Fraud Ring Detector.
+
+Endpoints
+---------
+GET  /                          health check
+GET  /api/stats                 pre-computed graph stats (fast)
+GET  /api/rings                 top fraud rings from clustering
+GET  /api/investigate/{account} lookup a specific account
+"""
+
+import json
+import os
+import pickle
+import time
+
+import torch
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from sklearn.cluster import MiniBatchKMeans
 
-app = FastAPI(title="FraudGNN Live API", description="Continuous Graph Neural Network Engine")
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
 
-# Configure CORS so your React frontend (Vite) can communicate with this API
+PYG_GRAPH_PATH    = os.path.join(PROCESSED_DIR, "pyg_graph.pt")
+EMBEDDINGS_PATH   = os.path.join(PROCESSED_DIR, "gnn_embeddings.pt")
+NODE_MAPPING_PATH = os.path.join(PROCESSED_DIR, "node_mapping.pkl")
+STATS_PATH        = os.path.join(PROCESSED_DIR, "graph_stats.json")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="FraudGNN API", description="Graph Neural Network Fraud Detection Engine")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -12,94 +45,216 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =====================================================================
-# SIMULATED GNN DATABASE (Based on our exact PyTorch results)
-# In production, these endpoints would query your PyTorch models or a Graph DB.
-# =====================================================================
+# ---------------------------------------------------------------------------
+# Artifact cache — loaded once on first request
+# ---------------------------------------------------------------------------
+_cache: dict = {}
 
-STATS = {
-    "total_nodes": 9073900,
-    "total_edges": 6362620,
-    "known_fraudsters": 16382,
-    "suspected_mules": 33349
-}
+def get_artifacts():
+    if _cache:
+        return _cache
 
-# The top 5 threat networks discovered by MiniBatchKMeans
-RINGS = [
-    {"cluster_id": 102, "rank": 1, "total_accounts": 8214, "known_fraudsters": 8213, "suspected_mules": 1, "top_targets": ["C439737079"]},
-    {"cluster_id": 125, "rank": 2, "total_accounts": 2685, "known_fraudsters": 2678, "suspected_mules": 7, "top_targets": ["M360644783", "M321063872"]},
-    {"cluster_id": 469, "rank": 3, "total_accounts": 6444, "known_fraudsters": 7, "suspected_mules": 6437, "top_targets": ["C997608398"]},
-    {"cluster_id": 284, "rank": 4, "total_accounts": 5484, "known_fraudsters": 5484, "suspected_mules": 0, "top_targets": []},
-    {"cluster_id": 184, "rank": 5, "total_accounts": 26904, "known_fraudsters": 0, "suspected_mules": 26904, "top_targets": ["C1231006815"]}
-]
+    print("Loading graph stats...")
+    with open(STATS_PATH) as f:
+        _cache["stats"] = json.load(f)
 
-# Specific deep-dive topology data for our suspected mules
-INVESTIGATIONS = {
-    "C439737079": {
-        "risk_level": "CRITICAL RISK",
-        "description": "Account sits at the exact mathematical center of 8,213 known fraudsters. Acting as a centralized sink (receiver) for micro-transactions.",
-        "cluster_id": 102,
-        "cluster_size": 8214,
-        "fraud_ratio": 8213 / 8214,
-        "graph_data": {
-            "nodes": [
-                {"id": "C439737079", "group": "mule"},
-                {"id": "F_8831", "group": "fraud"},
-                {"id": "F_9921", "group": "fraud"},
-                {"id": "F_1023", "group": "fraud"},
-                {"id": "F_4421", "group": "fraud"},
-                {"id": "Victim_A", "group": "normal"},
-                {"id": "Victim_B", "group": "normal"}
-            ],
-            "links": [
-                {"source": "F_8831", "target": "C439737079"},
-                {"source": "F_9921", "target": "C439737079"},
-                {"source": "F_1023", "target": "C439737079"},
-                {"source": "F_4421", "target": "C439737079"},
-                {"source": "F_8831", "target": "F_9921"},
-                {"source": "Victim_A", "target": "F_8831"},
-                {"source": "Victim_B", "target": "F_1023"}
-            ]
-        }
-    }
-}
+    print("Loading node mapping...")
+    with open(NODE_MAPPING_PATH, "rb") as f:
+        mapping = pickle.load(f)
+    _cache["node_to_idx"] = mapping
+    _cache["idx_to_node"] = {v: k for k, v in mapping.items()}
 
-# =====================================================================
-# REST ENDPOINTS
-# =====================================================================
+    print("Loading PyG graph...")
+    data = torch.load(PYG_GRAPH_PATH, weights_only=False)
+    _cache["data"] = data
+
+    print("Loading GNN embeddings...")
+    embeddings = torch.load(EMBEDDINGS_PATH, weights_only=True).numpy()
+    _cache["embeddings"] = embeddings
+
+    # Build fraud node set
+    is_fraud    = data.edge_attr[:, 3].bool()
+    fraud_edges = data.edge_index[:, is_fraud]
+    fraud_nodes = torch.cat([fraud_edges[0], fraud_edges[1]]).unique().numpy()
+    _cache["known_fraud_set"] = set(fraud_nodes.tolist())
+
+    print("Running MiniBatchKMeans (500 clusters)...")
+    t0 = time.time()
+    kmeans = MiniBatchKMeans(n_clusters=500, batch_size=10_000, random_state=42, n_init="auto")
+    cluster_labels = kmeans.fit_predict(embeddings)
+    _cache["cluster_labels"] = cluster_labels
+    print(f"Clustering done in {time.time()-t0:.1f}s")
+
+    cluster_fraud_counts: dict[int, int]       = {}
+    cluster_members:      dict[int, list[int]] = {}
+    for node_id, cid in enumerate(cluster_labels):
+        cid = int(cid)
+        cluster_members.setdefault(cid, []).append(node_id)
+        if node_id in _cache["known_fraud_set"]:
+            cluster_fraud_counts[cid] = cluster_fraud_counts.get(cid, 0) + 1
+
+    _cache["cluster_members"]      = cluster_members
+    _cache["cluster_fraud_counts"] = cluster_fraud_counts
+
+    print("✅ All artifacts loaded.")
+    return _cache
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def health_check():
+    return {"status": "GNN Engine online"}
+
 
 @app.get("/api/stats")
 def get_stats():
-    """Returns top-level scanning metrics."""
-    return STATS
+    arts  = get_artifacts()
+    stats = arts["stats"]
+
+    sorted_clusters = sorted(
+        arts["cluster_fraud_counts"].items(), key=lambda x: x[1], reverse=True
+    )[:20]
+    suspected_mules = sum(
+        len(arts["cluster_members"][cid]) - fc
+        for cid, fc in sorted_clusters
+    )
+
+    return {
+        "total_nodes":      stats["num_nodes"],
+        "total_edges":      stats["num_edges"],
+        "known_fraudsters": len(arts["known_fraud_set"]),
+        "suspected_mules":  int(suspected_mules),
+    }
 
 
 @app.get("/api/rings")
-def get_rings(top_n: int = Query(10, description="Number of rings to return")):
-    """Returns the most dangerous identified clusters."""
-    return {"rings": RINGS[:top_n]}
+def get_rings(top_n: int = 10):
+    arts   = get_artifacts()
+    idx_to = arts["idx_to_node"]
+
+    sorted_clusters = sorted(
+        arts["cluster_fraud_counts"].items(), key=lambda x: x[1], reverse=True
+    )[:top_n]
+
+    rings = []
+    for rank, (cid, fraud_count) in enumerate(sorted_clusters, start=1):
+        members      = arts["cluster_members"][cid]
+        total        = len(members)
+        mules        = total - fraud_count
+        non_fraud    = [n for n in members if n not in arts["known_fraud_set"]]
+        top_targets  = [idx_to[n] for n in non_fraud[:3]]
+
+        rings.append({
+            "rank":             rank,
+            "cluster_id":       cid,
+            "total_accounts":   total,
+            "known_fraudsters": fraud_count,
+            "suspected_mules":  mules,
+            "top_targets":      top_targets,
+        })
+
+    return {"rings": rings}
 
 
 @app.get("/api/investigate/{account_id}")
 def investigate_account(account_id: str):
-    """
-    Returns specific risk details and network topology for a requested account.
-    If the account isn't in our high-risk DB, return a clean profile.
-    """
-    account_id = account_id.strip()
-    
-    if account_id in INVESTIGATIONS:
-        return INVESTIGATIONS[account_id]
-        
-    # Standard response for safe/unflagged accounts
+    arts = get_artifacts()
+
+    if account_id not in arts["node_to_idx"]:
+        raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found in graph.")
+
+    node_idx         = arts["node_to_idx"][account_id]
+    cid              = int(arts["cluster_labels"][node_idx])
+    members          = arts["cluster_members"][cid]
+    fraud_in_cluster = arts["cluster_fraud_counts"].get(cid, 0)
+    fraud_ratio      = fraud_in_cluster / max(len(members), 1)
+    is_known_fraud   = node_idx in arts["known_fraud_set"]
+
+    if is_known_fraud:
+        risk = "CONFIRMED FRAUD"
+    elif fraud_ratio > 0.5:
+        risk = "CRITICAL RISK"
+    elif fraud_ratio > 0.1:
+        risk = "HIGH RISK"
+    elif fraud_ratio > 0.01:
+        risk = "MEDIUM RISK"
+    else:
+        risk = "LOW RISK"
+
     return {
-        "risk_level": "LOW RISK",
-        "description": "No topological proximity to known fraud clusters detected in the embedding space. Account behavior appears normal.",
-        "cluster_id": "Unassigned",
-        "cluster_size": 1,
-        "fraud_ratio": 0.0,
+        "account_id":         account_id,
+        "node_index":         node_idx,
+        "cluster_id":         cid,
+        "cluster_size":       len(members),
+        "fraud_in_cluster":   fraud_in_cluster,
+        "fraud_ratio":        round(fraud_ratio, 4),
+        "is_known_fraudster": is_known_fraud,
+        "risk_level":         risk,
+        "description": (
+            f"Account {account_id} is in cluster {cid} with {len(members):,} accounts, "
+            f"{fraud_in_cluster:,} confirmed fraudsters "
+            f"({fraud_ratio*100:.1f}% fraud density)."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyze  — accepts a CSV upload, returns metrics + graph_data
+# ---------------------------------------------------------------------------
+from fastapi import File, UploadFile
+import io
+import pandas as pd
+
+@app.post("/api/analyze")
+async def analyze_dataset(file: UploadFile = File(...)):
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV.")
+
+    contents = await file.read()
+    df = pd.read_csv(io.StringIO(contents.decode("utf-8")), nrows=100_000)
+
+    required = {"nameOrig", "nameDest", "amount", "isFraud"}
+    if not required.issubset(df.columns):
+        missing = required - set(df.columns)
+        raise HTTPException(status_code=400, detail=f"Missing columns: {missing}")
+
+    # Build a small representative graph for visualisation
+    fraud_df   = df[df["isFraud"] == 1].head(50)
+    normal_df  = df[df["isFraud"] == 0].head(30)
+    sample     = pd.concat([fraud_df, normal_df])
+
+    node_ids: set[str] = set()
+    links = []
+    for _, row in sample.iterrows():
+        node_ids.add(row["nameOrig"])
+        node_ids.add(row["nameDest"])
+        links.append({"source": row["nameOrig"], "target": row["nameDest"]})
+
+    fraud_senders   = set(df[df["isFraud"] == 1]["nameOrig"])
+    fraud_receivers = set(df[df["isFraud"] == 1]["nameDest"])
+    nodes = []
+    for nid in node_ids:
+        if nid in fraud_senders:
+            group = "fraud"
+        elif nid in fraud_receivers:
+            group = "mule"
+        else:
+            group = "normal"
+        nodes.append({"id": nid, "group": group})
+
+    return {
+        "status": "success",
+        "metrics": {
+            "total_nodes":      df["nameOrig"].nunique() + df["nameDest"].nunique(),
+            "total_edges":      len(df),
+            "known_fraudsters": int(df[df["isFraud"] == 1]["nameOrig"].nunique()),
+            "suspected_mules":  int(df[df["isFraud"] == 1]["nameDest"].nunique()),
+        },
         "graph_data": {
-            "nodes": [{"id": account_id, "group": "normal"}],
-            "links": []
-        }
+            "nodes": nodes,
+            "links": links,
+        },
     }

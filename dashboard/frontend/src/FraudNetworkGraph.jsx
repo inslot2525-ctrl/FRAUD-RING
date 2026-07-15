@@ -1,42 +1,79 @@
-import React, { useRef } from 'react';
-import ForceGraph2D from 'react-force-graph-2d';
+import { useRef, useEffect } from 'react'
+import ForceGraph2D from 'react-force-graph-2d'
 
-// We now pass graphData directly as a prop from the backend!
-const FraudNetworkGraph = ({ graphData }) => {
-  const graphRef = useRef();
+/**
+ * FraudNetworkGraph.jsx
+ * Renders the graph_data payload returned by POST /api/analyze.
+ *
+ * Props
+ * -----
+ * graphData : { nodes: [{id, group}], links: [{source, target}] }
+ * width     : canvas width  (default 100% of container)
+ * height    : canvas height (default 420)
+ */
 
-  if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
-    return <div className="text-white/50 p-4 text-center">No topology data available from backend.</div>;
+const GROUP_COLOR = {
+  fraud:  '#ef4444',   // red
+  mule:   '#22d3ee',   // cyan
+  normal: '#6b7280',   // gray
+}
+
+export default function FraudNetworkGraph({ graphData, width, height = 420 }) {
+  const graphRef = useRef()
+
+  useEffect(() => {
+    if (graphRef.current) {
+      graphRef.current.d3Force('charge').strength(-180)
+    }
+  }, [graphData])
+
+  if (!graphData || !graphData.nodes?.length) return null
+
+  // Enrich nodes with colour
+  const enriched = {
+    nodes: graphData.nodes.map(n => ({
+      ...n,
+      color: GROUP_COLOR[n.group] ?? '#ffffff',
+    })),
+    links: graphData.links,
   }
 
   return (
-    <div className="rounded-xl overflow-hidden border border-white/10 bg-black/50 backdrop-blur-md h-[400px] w-full relative">
-      <div className="absolute top-4 left-4 z-10 flex gap-4 text-xs">
-        <span className="flex items-center gap-1 text-red-400"><div className="w-3 h-3 rounded-full bg-red-500"></div> Known Fraudsters</span>
-        <span className="flex items-center gap-1 text-cyan-400"><div className="w-3 h-3 rounded-full bg-cyan-400"></div> Suspected Mule</span>
-        <span className="flex items-center gap-1 text-gray-400"><div className="w-3 h-3 rounded-full bg-gray-500"></div> Normal Accounts</span>
-      </div>
-      
-      <ForceGraph2D
-        ref={graphRef}
-        graphData={graphData} // Fed directly from FastAPI
-        width={800} 
-        height={400}
-        nodeLabel="id"
-        nodeColor={node => {
-          if (node.group === 'mule') return '#22d3ee'; // Cyan
-          if (node.group === 'fraud') return '#ef4444'; // Red
-          return '#6b7280'; // Gray
-        }}
-        nodeRelSize={5}
-        linkColor={() => 'rgba(255,255,255,0.15)'}
-        linkDirectionalParticles={2} 
-        linkDirectionalParticleSpeed={0.008}
-        backgroundColor="rgba(0,0,0,0)"
-        onEngineStop={() => graphRef.current?.zoomToFit(400, 50)}
-      />
-    </div>
-  );
-};
+    <ForceGraph2D
+      ref={graphRef}
+      graphData={enriched}
+      width={width}
+      height={height}
+      backgroundColor="transparent"
+      nodeLabel="id"
+      nodeRelSize={6}
+      nodeColor={n => n.color}
+      linkColor={() => 'rgba(255,255,255,0.12)'}
+      linkWidth={1}
+      nodeCanvasObject={(node, ctx, globalScale) => {
+        const r    = node.group === 'mule' ? 7 : 5
+        const font = Math.max(10 / globalScale, 3)
 
-export default FraudNetworkGraph;
+        // glow
+        ctx.shadowBlur  = node.group === 'mule' ? 14 : 8
+        ctx.shadowColor = node.color
+
+        ctx.beginPath()
+        ctx.arc(node.x, node.y, r, 0, 2 * Math.PI)
+        ctx.fillStyle = node.color
+        ctx.fill()
+        ctx.shadowBlur = 0
+
+        // label
+        if (globalScale > 1.2) {
+          ctx.font      = `${font}px sans-serif`
+          ctx.fillStyle = '#e5e7eb'
+          ctx.textAlign = 'center'
+          ctx.fillText(node.id, node.x, node.y - r - 2)
+        }
+      }}
+      cooldownTicks={100}
+      onEngineStop={() => graphRef.current?.zoomToFit(400, 40)}
+    />
+  )
+}

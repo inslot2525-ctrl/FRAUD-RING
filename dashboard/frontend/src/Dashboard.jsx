@@ -1,241 +1,182 @@
-import React, { useState, useEffect } from 'react'
-import { Shield, Users, AlertTriangle, Search, Loader2 } from 'lucide-react'
+import { useState } from 'react'
+import { Shield, Users, AlertTriangle, Search, Loader2, Upload, FileText } from 'lucide-react'
 import AnoAI from './AnoAI'
 import FraudNetworkGraph from './FraudNetworkGraph'
 
-const API = 'http://localhost:8000'
+const API = 'http://localhost:8001'
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 function fmt(n) {
   return typeof n === 'number' ? n.toLocaleString() : n
 }
 
-function riskColor(level) {
-  const map = {
-    'CONFIRMED FRAUD': 'text-red-400 border-red-500/50 bg-red-500/10',
-    'CRITICAL RISK':   'text-red-400 border-red-500/30 bg-red-500/10',
-    'HIGH RISK':       'text-orange-400 border-orange-500/30 bg-orange-500/10',
-    'MEDIUM RISK':     'text-yellow-400 border-yellow-500/30 bg-yellow-500/10',
-    'LOW RISK':        'text-green-400 border-green-500/30 bg-green-500/10',
-  }
-  return map[level] ?? 'text-gray-400 border-white/20 bg-white/5'
-}
-
-// ---------------------------------------------------------------------------
-// Sub-components
-// ---------------------------------------------------------------------------
 function MetricCard({ title, value, icon, color = 'text-white', loading }) {
   return (
     <div className="bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6 flex items-start justify-between">
       <div>
         <p className="text-gray-400 text-sm mb-1">{title}</p>
-        {loading
-          ? <Loader2 className="animate-spin text-gray-500 mt-2" size={24} />
-          : <h3 className={`text-3xl font-light ${color}`}>{fmt(value)}</h3>
-        }
+        {loading ? (
+          <Loader2 className="animate-spin text-gray-500 mt-2" size={24} />
+        ) : (
+          <h3 className={`text-3xl font-light ${color}`}>{value ? fmt(value) : '—'}</h3>
+        )}
       </div>
       <div className={`p-3 bg-white/5 rounded-lg ${color}`}>{icon}</div>
     </div>
   )
 }
 
-function RingsTable({ rings, loading }) {
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center h-40 gap-2 text-gray-400">
-        <Loader2 className="animate-spin" size={20} /> Loading rings...
-      </div>
-    )
-  }
-  if (!rings.length) return <p className="text-gray-500 text-sm">No rings data available.</p>
-
-  return (
-    <table className="w-full text-left border-collapse">
-      <thead>
-        <tr className="border-b border-white/10 text-gray-400 text-sm">
-          <th className="pb-3">Ring</th>
-          <th className="pb-3">Total Accounts</th>
-          <th className="pb-3">Known Fraudsters</th>
-          <th className="pb-3 text-cyan-400">Suspected Mules</th>
-          <th className="pb-3 text-gray-400">Top Target</th>
-        </tr>
-      </thead>
-      <tbody className="text-sm">
-        {rings.map((r) => (
-          <tr
-            key={r.cluster_id}
-            className={`border-b border-white/5 ${r.rank === 1 ? 'bg-red-500/10' : ''}`}
-          >
-            <td className="py-3">Ring #{r.cluster_id}</td>
-            <td>{fmt(r.total_accounts)}</td>
-            <td>{fmt(r.known_fraudsters)}</td>
-            <td className="font-bold text-cyan-400">{fmt(r.suspected_mules)}</td>
-            <td className="text-gray-400 font-mono text-xs">{r.top_targets?.[0] ?? '—'}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Main Dashboard
-// ---------------------------------------------------------------------------
 export default function Dashboard() {
-  const [stats,         setStats]         = useState(null)
-  const [rings,         setRings]         = useState([])
-  const [statsLoading,  setStatsLoading]  = useState(true)
-  const [ringsLoading,  setRingsLoading]  = useState(true)
-  const [apiError,      setApiError]      = useState(null)
+  const [file, setFile] = useState(null)
+  const [uploading, setUploading] = useState(false)
+  const [stats, setStats] = useState(null)
+  const [graphData, setGraphData] = useState(null)
+  const [error, setError] = useState(null)
 
-  const [searchQuery,   setSearchQuery]   = useState('')
-  const [investigation, setInvestigation] = useState(null)
-  const [searchLoading, setSearchLoading] = useState(false)
-  const [searchError,   setSearchError]   = useState(null)
+  // Handle file selection
+  const handleFileChange = (e) => {
+    if (e.target.files && e.target.files[0]) {
+      setFile(e.target.files[0])
+      setError(null)
+    }
+  }
 
-  // Fetch stats and rings on mount
-  useEffect(() => {
-    fetch(`${API}/api/stats`)
-      .then(r => r.json())
-      .then(d => { setStats(d); setStatsLoading(false) })
-      .catch(() => { setApiError('Cannot reach API — is the server running?'); setStatsLoading(false) })
-
-    fetch(`${API}/api/rings?top_n=10`)
-      .then(r => r.json())
-      .then(d => { setRings(d.rings ?? []); setRingsLoading(false) })
-      .catch(() => setRingsLoading(false))
-  }, [])
-
-  // Investigate account
-  async function handleSearch(e) {
+  // Upload CSV and run fraud detection pipeline
+  const handleUploadSubmit = async (e) => {
     e.preventDefault()
-    if (!searchQuery.trim()) return
-    setSearchLoading(true)
-    setInvestigation(null)
-    setSearchError(null)
+    if (!file) return
+
+    setUploading(true)
+    setError(null)
+    setStats(null)
+    setGraphData(null)
+
+    const formData = new FormData()
+    formData.append('file', file)
+
     try {
-      const res = await fetch(`${API}/api/investigate/${searchQuery.trim()}`)
+      const res = await fetch(`${API}/api/analyze`, {
+        method: 'POST',
+        body: formData,
+      })
+
       if (!res.ok) {
-        const err = await res.json()
-        setSearchError(err.detail ?? 'Account not found.')
-      } else {
-        setInvestigation(await res.json())
+        const errData = await res.json()
+        throw new Error(errData.detail || 'Failed to process dataset.')
       }
-    } catch {
-      setSearchError('Cannot reach API.')
+
+      const data = await res.json()
+      // Populate dashboard state with the backend GNN output
+      setStats(data.metrics)
+      setGraphData(data.graph_data)
+    } catch (err) {
+      setError(err.message || 'Cannot reach the GNN backend server.')
     } finally {
-      setSearchLoading(false)
+      setUploading(false)
     }
   }
 
   return (
     <div className="relative min-h-screen text-white font-sans bg-black">
-
-      {/* AnoAI Three.js aurora background */}
+      {/* Three.js Background Shader Layer */}
       <div className="absolute inset-0 z-0">
         <AnoAI />
       </div>
 
-      <div className="relative z-10 p-8 min-h-screen bg-black/30 backdrop-blur-sm">
-
-        {/* API error banner */}
-        {apiError && (
-          <div className="mb-6 p-4 rounded-xl border border-yellow-500/40 bg-yellow-500/10 text-yellow-300 text-sm">
-            ⚠ {apiError}
-          </div>
-        )}
-
+      <div className="relative z-10 p-8 min-h-screen bg-black/40 backdrop-blur-sm space-y-8">
         {/* Header */}
-        <header className="flex justify-between items-center mb-10 border-b border-white/10 pb-4">
+        <header className="flex justify-between items-center border-b border-white/10 pb-4">
           <div className="flex items-center gap-3">
             <Shield className="text-cyan-400 w-8 h-8" />
             <h1 className="text-3xl font-light tracking-wider">
-              FRAUD<span className="font-bold">RING</span> DETECTOR
+              FRAUD<span className="font-bold">RING</span> GNN ENGINE
             </h1>
           </div>
-          <span className="text-xs text-gray-500 border border-white/10 px-4 py-2 rounded-full">
-            Live · GNN Engine
+          <span className="text-xs text-gray-400 border border-white/10 px-4 py-2 rounded-full bg-black/20">
+            Pipeline: Upload &rarr; Detect &rarr; Visualize
           </span>
         </header>
 
-        {/* Metric cards */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-10">
-          <MetricCard title="Accounts Scanned"    value={stats?.total_nodes}      icon={<Users size={20}/>}         loading={statsLoading} />
-          <MetricCard title="Total Transactions"  value={stats?.total_edges}      icon={<AlertTriangle size={20}/>} loading={statsLoading} />
-          <MetricCard title="Known Fraudsters"    value={stats?.known_fraudsters} icon={<Shield size={20}/>}        loading={statsLoading} color="text-red-400" />
-          <MetricCard title="Suspected Mules"     value={stats?.suspected_mules}  icon={<Search size={20}/>}        loading={statsLoading} color="text-cyan-400" />
+        {/* Error Alert Banner */}
+        {error && (
+          <div className="p-4 rounded-xl border border-red-500/40 bg-red-500/10 text-red-300 text-sm">
+            ⚠ {error}
+          </div>
+        )}
+
+        {/* Upload Box Component */}
+        <div className="bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
+          <h2 className="text-xl font-medium mb-2">1. Upload Transaction Dataset</h2>
+          <p className="text-gray-400 text-xs mb-4">Select your bank ledger CSV format containing sender/receiver mappings to run through the Graph Neural Network.</p>
+          
+          <form onSubmit={handleUploadSubmit} className="flex flex-col md:flex-row items-stretch md:items-center gap-4">
+            <div className="flex-1 relative border border-dashed border-white/20 hover:border-cyan-400/50 rounded-xl p-4 flex items-center justify-center bg-black/30 transition-all cursor-pointer">
+              <input 
+                type="file" 
+                accept=".csv" 
+                onChange={handleFileChange}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              />
+              <div className="flex items-center gap-3 text-sm text-gray-300">
+                {file ? <FileText className="text-cyan-400 animate-pulse" size={20} /> : <Upload size={20} />}
+                <span>{file ? file.name : 'Choose transaction_ledger.csv...'}</span>
+              </div>
+            </div>
+            
+            <button
+              type="submit"
+              disabled={!file || uploading}
+              className="px-8 py-4 rounded-xl bg-cyan-500/20 border border-cyan-500/40 text-cyan-200 font-medium text-sm hover:bg-cyan-500/30 active:scale-[0.98] transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2"
+            >
+              {uploading ? (
+                <>
+                  <Loader2 size={16} className="animate-spin" />
+                  Running GNN Analysis...
+                </>
+              ) : (
+                'Execute Fraud Detection'
+              )}
+            </button>
+          </form>
         </div>
 
-        {/* Main grid */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* Global Network Analytics Summary */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
+          <MetricCard title="Total Accounts Scanned" value={stats?.total_nodes} icon={<Users size={20}/>} loading={uploading} />
+          <MetricCard title="Transactions Processed" value={stats?.total_edges} icon={<AlertTriangle size={20}/>} loading={uploading} />
+          <MetricCard title="Known Malicious Hubs" value={stats?.known_fraudsters} icon={<Shield size={20}/>} loading={uploading} color="text-red-400" />
+          <MetricCard title="Newly Identified Mules" value={stats?.suspected_mules} icon={<Search size={20}/>} loading={uploading} color="text-cyan-400" />
+        </div>
 
-          {/* Rings table */}
-          <div className="col-span-2 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
-            <h2 className="text-xl font-medium mb-4">Critical Threat Networks</h2>
-            <RingsTable rings={rings} loading={ringsLoading} />
-          </div>
-
-          {/* Network graph */}
-          <div className="col-span-2 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6 mt-0">
-            <h2 className="text-xl font-medium mb-2">Network Topology</h2>
-            <p className="text-gray-500 text-xs mb-3">
-              {investigation 
-                ? `Showing topology for investigated node: ${searchQuery}` 
-                : "Investigate a suspicious node ID below to render its hidden network topology."}
-            </p>
-            <div className="rounded-xl overflow-hidden">
-              <FraudNetworkGraph graphData={investigation?.graph_data} />
-            </div>
-          </div>
-
-          {/* Investigate Pane */}
-          <div className="col-span-1 bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
-            <h2 className="text-xl font-medium mb-4">Investigate Node</h2>
-            <form onSubmit={handleSearch} className="mb-4">
-              <input
-                type="text"
-                placeholder="Enter Account ID (e.g. C439737079)"
-                className="w-full bg-black/50 border border-white/20 rounded-lg py-3 px-4 text-white focus:outline-none focus:border-cyan-400 text-sm mb-3"
-                value={searchQuery}
-                onChange={e => setSearchQuery(e.target.value)}
-              />
-              <button
-                type="submit"
-                disabled={searchLoading}
-                className="w-full bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-500/40 text-cyan-200 py-2 rounded-lg transition-all text-sm flex items-center justify-center gap-2"
-              >
-                {searchLoading ? <><Loader2 size={14} className="animate-spin"/> Analysing...</> : 'Investigate'}
-              </button>
-            </form>
-
-            {searchError && (
-              <p className="text-yellow-400 text-sm p-3 border border-yellow-500/30 bg-yellow-500/10 rounded-lg">
-                {searchError}
-              </p>
-            )}
-
-            {investigation && (
-              <div className={`p-4 border rounded-lg ${riskColor(investigation.risk_level)}`}>
-                <h3 className="font-bold flex items-center gap-2 mb-2">
-                  <AlertTriangle size={16} /> {investigation.risk_level}
-                </h3>
-                <p className="text-xs text-gray-300 mb-3">{investigation.description}</p>
-                <div className="text-xs space-y-1 text-gray-400">
-                  <p>Cluster ID    : <span className="text-white">{investigation.cluster_id}</span></p>
-                  <p>Cluster size  : <span className="text-white">{fmt(investigation.cluster_size)}</span></p>
-                  <p>Fraud density : <span className="text-white">{(investigation.fraud_ratio * 100).toFixed(1)}%</span></p>
-                </div>
-                {investigation.risk_level !== 'LOW RISK' && (
-                  <button className="mt-4 w-full bg-red-500/20 hover:bg-red-500/40 border border-red-500/50 text-red-200 py-2 rounded transition-all text-sm">
-                    Flag Account for Review
-                  </button>
+        {/* Main Graph Dynamic Container */}
+        <div className="bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
+          <h2 className="text-xl font-medium mb-1">2. Network Topology & Risk Clusters</h2>
+          <p className="text-gray-400 text-xs mb-4">
+            {graphData 
+              ? 'Interactive WebGL visualization generated from GNN node embeddings.' 
+              : 'Graph network structure will automatically generate here once a dataset has completed scanning.'}
+          </p>
+          
+          <div className="rounded-xl overflow-hidden bg-black/40 border border-white/5 flex items-center justify-center min-h-[400px]">
+            {graphData ? (
+              <FraudNetworkGraph graphData={graphData} />
+            ) : (
+              <div className="text-center p-8 space-y-2">
+                {uploading ? (
+                  <>
+                    <Loader2 size={36} className="animate-spin mx-auto text-cyan-400" />
+                    <p className="text-sm text-gray-400">Constructing topological graph matrix...</p>
+                  </>
+                ) : (
+                  <>
+                    <div className="w-12 h-12 rounded-full border border-white/10 flex items-center justify-center mx-auto mb-2 text-gray-500">
+                      <Search size={20} />
+                    </div>
+                    <p className="text-sm text-gray-400">Waiting for data payload upload...</p>
+                  </>
                 )}
               </div>
             )}
           </div>
-
         </div>
       </div>
     </div>
