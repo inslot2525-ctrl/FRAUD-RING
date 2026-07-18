@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { Shield, Users, AlertTriangle, Search, Loader2, Upload, FileText } from 'lucide-react'
+import { useNavigate } from 'react-router-dom'
+import { Shield, Users, AlertTriangle, Search, Loader2, Upload, FileText, ArrowLeft } from 'lucide-react'
 import AnoAI from './AnoAI'
 import FraudNetworkGraph from './FraudNetworkGraph'
 
@@ -26,6 +27,7 @@ function MetricCard({ title, value, icon, color = 'text-white', loading }) {
 }
 
 export default function Dashboard() {
+  const navigate = useNavigate()
   const [file, setFile] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [stats, setStats] = useState(null)
@@ -86,9 +88,16 @@ export default function Dashboard() {
         {/* Header */}
         <header className="flex justify-between items-center border-b border-white/10 pb-4">
           <div className="flex items-center gap-3">
+            <button
+              onClick={() => navigate('/')}
+              className="p-2 rounded-lg hover:bg-white/10 text-gray-400 hover:text-white transition-all mr-1"
+              title="Back to home"
+            >
+              <ArrowLeft size={18} />
+            </button>
             <Shield className="text-cyan-400 w-8 h-8" />
             <h1 className="text-3xl font-light tracking-wider">
-              FRAUD<span className="font-bold">RING</span> GNN ENGINE
+              FREC<span className="font-bold">TION</span> GNN ENGINE
             </h1>
           </div>
           <span className="text-xs text-gray-400 border border-white/10 px-4 py-2 rounded-full bg-black/20">

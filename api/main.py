@@ -37,7 +37,7 @@ STATS_PATH        = os.path.join(PROCESSED_DIR, "graph_stats.json")
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="FraudGNN API")
+app = FastAPI(title="Frection API")
 
 app.add_middleware(
     CORSMiddleware,
