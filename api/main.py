@@ -280,21 +280,77 @@ async def analyze_dataset(file: UploadFile = File(...)):
     # Falls back to the CSV isFraud column if artifacts aren't loaded yet.
     ai_predictions: dict[str, str] = {}
 
-    # --- collect CSV node sets for name-based fallback -------------------------
+    # --- collect CSV node sets ---------------------------------------------------
     all_csv_nodes   = set(df["nameOrig"].dropna().astype(str)) | set(df["nameDest"].dropna().astype(str))
     fraud_senders   = set(df[df["isFraud"] == 1]["nameOrig"].dropna().astype(str))
     fraud_receivers = set(df[df["isFraud"] == 1]["nameDest"].dropna().astype(str))
 
-    # Helper: classify a node by its name (used as fallback / supplement)
-    def classify_by_name(nid: str) -> str:
+    # ------------------------------------------------------------------
+    # STRUCTURAL / BEHAVIOURAL GRAPH ANALYSIS
+    # Detect fraud rings even when node names are opaque (e.g. F3001)
+    # ------------------------------------------------------------------
+    src = df["nameOrig"].dropna().astype(str)
+    dst = df["nameDest"].dropna().astype(str)
+
+    # How many distinct senders does each node receive from?
+    in_degree_unique  = df.groupby("nameDest")["nameOrig"].nunique().to_dict()
+    # How many distinct receivers does each node send to?
+    out_degree_unique = df.groupby("nameOrig")["nameDest"].nunique().to_dict()
+    # Total outgoing amount per node
+    if "amount" in df.columns:
+        out_amount = df.groupby("nameOrig")["amount"].sum().to_dict()
+    else:
+        out_amount = {}
+
+    total_nodes = max(len(all_csv_nodes), 1)
+
+    # Thresholds — scale with dataset size so tiny CSVs still work
+    mule_fan_in_thresh  = max(2, total_nodes * 0.005)   # receives from ≥0.5% of nodes
+    fraud_fan_out_thresh = max(2, total_nodes * 0.003)  # sends to ≥0.3% of nodes
+
+    structural_mules  : set[str] = set()
+    structural_frauds : set[str] = set()
+
+    for nid in all_csv_nodes:
         nu = nid.upper()
+        # Name-based — highest confidence
         if "FRAUD" in nu:
-            return "fraud"
+            structural_frauds.add(nid); continue
         if "MULE" in nu or "OFFSHORE" in nu or "SHELL" in nu:
-            return "mule"
+            structural_mules.add(nid); continue
+        # isFraud column labels
         if nid in fraud_senders:
-            return "fraud"
+            structural_frauds.add(nid); continue
         if nid in fraud_receivers:
+            structural_mules.add(nid); continue
+
+        fan_in  = in_degree_unique.get(nid, 0)
+        fan_out = out_degree_unique.get(nid, 0)
+
+        # Mule hub pattern: many senders → this node → few destinations
+        if fan_in >= mule_fan_in_thresh and fan_out <= 3:
+            structural_mules.add(nid)
+        # Fraud actor pattern: sends to a mule hub (resolved in second pass)
+
+    # Second pass — nodes that send directly to a structural mule are fraud actors
+    mule_receivers = set(dst[src.isin(structural_mules)])   # who receives FROM mules? (offshore)
+    structural_mules |= mule_receivers                      # those are also mules (layering)
+
+    fraud_feeders = set(src[dst.isin(structural_mules)])    # who sends TO a mule?
+    for nid in fraud_feeders:
+        if nid not in structural_mules:
+            structural_frauds.add(nid)
+
+    print(f"🔍 Structural analysis → {len(structural_frauds)} fraud actors, "
+          f"{len(structural_mules)} mule/offshore nodes detected.")
+
+    # ------------------------------------------------------------------
+    # Helper that combines name + structural signals
+    # ------------------------------------------------------------------
+    def classify_node(nid: str) -> str:
+        if nid in structural_frauds:
+            return "fraud"
+        if nid in structural_mules:
             return "mule"
         return "normal"
 
@@ -314,18 +370,17 @@ async def analyze_dataset(file: UploadFile = File(...)):
                 fraud_ratio = cluster_fraud_counts.get(cid, 0) / max(len(cluster_members[cid]), 1)
                 ai_predictions[account_id] = "mule" if fraud_ratio > 0.1 else "normal"
 
-        # GNN mapping covers the pre-trained graph. For nodes in the *uploaded*
-        # CSV that aren't in that mapping (e.g. synthetically generated names like
-        # FRAUD_ACT_0_15), classify them using name patterns + isFraud column.
+        # For CSV nodes not covered by the pre-trained GNN mapping,
+        # use structural + name-based classification.
         gnn_covered = set(node_to_idx.keys())
         for nid in all_csv_nodes:
             if nid not in gnn_covered:
-                ai_predictions[nid] = classify_by_name(nid)
+                ai_predictions[nid] = classify_node(nid)
 
     except Exception as exc:
-        print(f"⚠️  GNN artifacts unavailable ({exc}), using CSV labels + name heuristics.")
+        print(f"⚠️  GNN artifacts unavailable ({exc}), using structural analysis.")
         for nid in all_csv_nodes:
-            ai_predictions[nid] = classify_by_name(nid)
+            ai_predictions[nid] = classify_node(nid)
 
     # ==================================================================
     # DYNAMIC GRAPH GENERATION & SMART SLICING
