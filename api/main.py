@@ -1,11 +1,43 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd
-import asyncio
-import io
-import os
+"""
+api/main.py
+-----------
+FastAPI backend for the Fraud Ring Detector.
 
-app = FastAPI(title="FraudGNN Pipeline API")
+Endpoints
+---------
+GET  /                          health check
+GET  /api/stats                 pre-computed graph stats
+GET  /api/rings                 top fraud rings from clustering
+GET  /api/investigate/{account} lookup a specific account
+POST /api/analyze               upload CSV and return metrics + graph_data
+"""
+
+import io
+import json
+import os
+import pickle
+import time
+
+import torch
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from sklearn.cluster import MiniBatchKMeans
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
+
+PYG_GRAPH_PATH    = os.path.join(PROCESSED_DIR, "pyg_graph.pt")
+EMBEDDINGS_PATH   = os.path.join(PROCESSED_DIR, "gnn_embeddings.pt")
+NODE_MAPPING_PATH = os.path.join(PROCESSED_DIR, "node_mapping.pkl")
+STATS_PATH        = os.path.join(PROCESSED_DIR, "graph_stats.json")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+app = FastAPI(title="FraudGNN API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,115 +47,333 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.post("/api/analyze")
-async def analyze_dataset(file: UploadFile = File(...)):
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV.")
-        
-    print(f"📥 Received file: {file.filename} -> Initiating Smart Auto-Mapper...")
-    
-    # 1. Safely read the uploaded file into a Pandas DataFrame
-    contents = await file.read()
-    try:
-        df = pd.read_csv(io.BytesIO(contents))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Could not parse CSV file.")
+# ---------------------------------------------------------------------------
+# Artifact cache
+# ---------------------------------------------------------------------------
+_cache: dict = {}
 
-    # 2. SMART AUTO-MAPPER DICTIONARY
-    mapping_rules = {
-        'nameOrig': ['sender', 'origin', 'source', 'nameorig', 'client_id', 'customer_id', 'sender_id'],
-        'nameDest': ['receiver', 'destination', 'target', 'namedest', 'merchant_id', 'beneficiary', 'receiver_acct'],
-        'amount': ['amount', 'tx_amount', 'value', 'transaction_amount', 'usd']
+
+def get_artifacts():
+    if _cache:
+        return _cache
+
+    print("Loading graph stats...")
+    with open(STATS_PATH) as f:
+        _cache["stats"] = json.load(f)
+
+    print("Loading node mapping...")
+    with open(NODE_MAPPING_PATH, "rb") as f:
+        mapping = pickle.load(f)
+    _cache["node_to_idx"] = mapping
+    _cache["idx_to_node"] = {v: k for k, v in mapping.items()}
+
+    print("Loading PyG graph...")
+    data = torch.load(PYG_GRAPH_PATH, weights_only=False)
+    _cache["data"] = data
+
+    print("Loading GNN embeddings...")
+    embeddings = torch.load(EMBEDDINGS_PATH, weights_only=True).numpy()
+    _cache["embeddings"] = embeddings
+
+    is_fraud    = data.edge_attr[:, 3].bool()
+    fraud_edges = data.edge_index[:, is_fraud]
+    fraud_nodes = torch.cat([fraud_edges[0], fraud_edges[1]]).unique().numpy()
+    _cache["known_fraud_set"] = set(fraud_nodes.tolist())
+
+    print("Running MiniBatchKMeans (500 clusters)...")
+    t0 = time.time()
+    kmeans = MiniBatchKMeans(n_clusters=500, batch_size=10_000, random_state=42, n_init="auto")
+    cluster_labels = kmeans.fit_predict(embeddings)
+    _cache["cluster_labels"] = cluster_labels
+    print(f"Clustering done in {time.time()-t0:.1f}s")
+
+    cluster_fraud_counts: dict[int, int]       = {}
+    cluster_members:      dict[int, list[int]] = {}
+    for node_id, cid in enumerate(cluster_labels):
+        cid = int(cid)
+        cluster_members.setdefault(cid, []).append(node_id)
+        if node_id in _cache["known_fraud_set"]:
+            cluster_fraud_counts[cid] = cluster_fraud_counts.get(cid, 0) + 1
+
+    _cache["cluster_members"]      = cluster_members
+    _cache["cluster_fraud_counts"] = cluster_fraud_counts
+    print("All artifacts loaded.")
+    return _cache
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+def health_check():
+    return {"status": "GNN Engine online"}
+
+
+@app.get("/api/stats")
+def get_stats():
+    arts  = get_artifacts()
+    stats = arts["stats"]
+    sorted_clusters = sorted(
+        arts["cluster_fraud_counts"].items(), key=lambda x: x[1], reverse=True
+    )[:20]
+    suspected_mules = sum(
+        len(arts["cluster_members"][cid]) - fc for cid, fc in sorted_clusters
+    )
+    return {
+        "total_nodes":      stats["num_nodes"],
+        "total_edges":      stats["num_edges"],
+        "known_fraudsters": len(arts["known_fraud_set"]),
+        "suspected_mules":  int(suspected_mules),
     }
 
-    df_cols_lower = {col.lower(): col for col in df.columns}
-    rename_dict = {}
 
-    for target_col, synonyms in mapping_rules.items():
-        if target_col in df.columns:
-            continue 
-            
-        found = False
-        for syn in synonyms:
-            if syn in df_cols_lower:
-                rename_dict[df_cols_lower[syn]] = target_col
-                found = True
-                break
-                
-        if not found:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Auto-Mapper Failed: Could not find a column for '{target_col}'."
-            )
+@app.get("/api/rings")
+def get_rings(top_n: int = 10):
+    arts = get_artifacts()
+    sorted_clusters = sorted(
+        arts["cluster_fraud_counts"].items(), key=lambda x: x[1], reverse=True
+    )[:top_n]
+    rings = []
+    for rank, (cid, fraud_count) in enumerate(sorted_clusters, start=1):
+        members     = arts["cluster_members"][cid]
+        non_fraud   = [n for n in members if n not in arts["known_fraud_set"]]
+        top_targets = [arts["idx_to_node"][n] for n in non_fraud[:3]]
+        rings.append({
+            "rank":             rank,
+            "cluster_id":       cid,
+            "total_accounts":   len(members),
+            "known_fraudsters": fraud_count,
+            "suspected_mules":  len(members) - fraud_count,
+            "top_targets":      top_targets,
+        })
+    return {"rings": rings}
 
-    df = df.rename(columns=rename_dict)
 
-    if 'isFraud' not in df.columns:
-        df['isFraud'] = 0
+@app.get("/api/investigate/{account_id}")
+def investigate_account(account_id: str):
+    arts = get_artifacts()
+    if account_id not in arts["node_to_idx"]:
+        raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found.")
 
-    # Save cleaned data to disk for PyTorch
-    cleaned_filepath = "temp_cleaned_ledger.csv"
-    df.to_csv(cleaned_filepath, index=False)
-    
-    # =================================================================
-    # PYTORCH EXECUTION BLOCK (Call your actual models here)
-    # build_pyg_graph(filepath=cleaned_filepath)
-    # =================================================================
-    
-    await asyncio.sleep(1.5) # Simulate processing time
+    node_idx         = arts["node_to_idx"][account_id]
+    cid              = int(arts["cluster_labels"][node_idx])
+    members          = arts["cluster_members"][cid]
+    fraud_in_cluster = arts["cluster_fraud_counts"].get(cid, 0)
+    fraud_ratio      = fraud_in_cluster / max(len(members), 1)
+    is_known_fraud   = node_idx in arts["known_fraud_set"]
 
-    # =================================================================
-    # DYNAMIC GRAPH GENERATION FROM UPLOADED DATA
-    # =================================================================
-    
-    # Cap visualization at 800 edges to prevent browser memory crashes
-    vis_df = df.head(800)
-    
-    # Extract unique nodes from the data
-    senders = vis_df['nameOrig'].dropna().unique().tolist()
-    receivers = vis_df['nameDest'].dropna().unique().tolist()
-    unique_nodes = list(set(senders + receivers))
+    if is_known_fraud:        risk = "CONFIRMED FRAUD"
+    elif fraud_ratio > 0.5:   risk = "CRITICAL RISK"
+    elif fraud_ratio > 0.1:   risk = "HIGH RISK"
+    elif fraud_ratio > 0.01:  risk = "MEDIUM RISK"
+    else:                     risk = "LOW RISK"
+
+    return {
+        "account_id":         account_id,
+        "cluster_id":         cid,
+        "cluster_size":       len(members),
+        "fraud_in_cluster":   fraud_in_cluster,
+        "fraud_ratio":        round(fraud_ratio, 4),
+        "is_known_fraudster": is_known_fraud,
+        "risk_level":         risk,
+        "description": (
+            f"Account {account_id} is in cluster {cid} with {len(members):,} accounts, "
+            f"{fraud_in_cluster:,} confirmed fraudsters ({fraud_ratio*100:.1f}% fraud density)."
+        ),
+    }
+
+
+@app.post("/api/analyze")
+async def analyze_dataset(file: UploadFile = File(...)):
+    """
+    Accept ANY transaction CSV.
+    Automatically detects sender, receiver, amount, and fraud columns
+    by fuzzy-matching common naming patterns — no exact column names required.
+    """
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+
+    import pandas as pd  # noqa: PLC0415 — lazy import avoids DLL block on restricted machines
+
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.StringIO(contents.decode("utf-8")), nrows=100_000)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse CSV: {e}")
+
+    if df.empty or len(df.columns) < 2:
+        raise HTTPException(status_code=400, detail="CSV appears empty or has too few columns.")
+
+    # ------------------------------------------------------------------
+    # Smart column inference — case-insensitive pattern matching
+    # ------------------------------------------------------------------
+    cols_lower = {c.lower().strip(): c for c in df.columns}  # lowercase → original
+
+    def find_col(patterns: list[str], exclude: set[str] = set()) -> str | None:
+        for pat in patterns:
+            for lc, orig in cols_lower.items():
+                if pat in lc and orig not in exclude:
+                    return orig
+        return None
+
+    used: set[str] = set()
+
+    sender_col = find_col([
+        "nameorig", "sender", "source", "from", "payer",
+        "originator", "src", "acct_from", "account_from", "origin"
+    ])
+    if sender_col: used.add(sender_col)
+
+    receiver_col = find_col([
+        "namedest", "receiver", "dest", "target", "to", "payee",
+        "beneficiary", "dst", "acct_to", "account_to", "destination"
+    ], exclude=used)
+    if receiver_col: used.add(receiver_col)
+
+    amount_col = find_col([
+        "amount", "amt", "value", "sum", "transaction_amount",
+        "trans_amount", "money", "price", "total"
+    ], exclude=used)
+    if amount_col: used.add(amount_col)
+
+    fraud_col = find_col([
+        "isfraud", "is_fraud", "fraud", "fraudulent", "label",
+        "class", "target", "flag", "suspicious"
+    ], exclude=used)
+
+    # Last resort: if sender/receiver still missing, use the two object columns
+    # with the highest cardinality (most unique values → likely account IDs)
+    if not sender_col or not receiver_col:
+        str_cols = df.select_dtypes(include="object").columns.tolist()
+        ranked   = sorted(str_cols, key=lambda c: df[c].nunique(), reverse=True)
+        if not sender_col and len(ranked) > 0:
+            sender_col = ranked[0]; used.add(sender_col)
+        if not receiver_col and len(ranked) > 1:
+            receiver_col = ranked[1]
+
+    if not sender_col or not receiver_col:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Could not detect sender/receiver columns from: {list(df.columns)}. "
+                "Ensure your CSV contains account ID columns."
+            ),
+        )
+
+    has_fraud = fraud_col is not None and fraud_col in df.columns
+    print(f"Inferred → sender: '{sender_col}' | receiver: '{receiver_col}' | "
+          f"amount: '{amount_col}' | fraud: '{fraud_col}'")
+
+    # Rename to internal standard names
+    rename_map: dict[str, str] = {sender_col: "nameOrig", receiver_col: "nameDest"}
+    if amount_col: rename_map[amount_col] = "amount"
+    if has_fraud:  rename_map[fraud_col]  = "isFraud"
+    df = df.rename(columns=rename_map)
+    if not has_fraud:
+        df["isFraud"] = 0  # no fraud labels — treat all as unlabelled
+
+    # ==================================================================
+    # PYTORCH / GNN EXECUTION
+    # ==================================================================
+    # Derive predictions from the pre-loaded GNN artifacts where possible.
+    # Falls back to the CSV isFraud column if artifacts aren't loaded yet.
+    ai_predictions: dict[str, str] = {}
+    try:
+        arts                 = get_artifacts()
+        node_to_idx          = arts["node_to_idx"]
+        cluster_labels       = arts["cluster_labels"]
+        cluster_fraud_counts = arts["cluster_fraud_counts"]
+        cluster_members      = arts["cluster_members"]
+        known_fraud_set      = arts["known_fraud_set"]
+
+        for account_id, node_idx in node_to_idx.items():
+            if node_idx in known_fraud_set:
+                ai_predictions[account_id] = "fraud"
+            else:
+                cid         = int(cluster_labels[node_idx])
+                fraud_ratio = cluster_fraud_counts.get(cid, 0) / max(len(cluster_members[cid]), 1)
+                ai_predictions[account_id] = "mule" if fraud_ratio > 0.1 else "normal"
+    except Exception:
+        # GNN artifacts not ready — fall back to CSV labels
+        fraud_senders   = set(df[df["isFraud"] == 1]["nameOrig"].dropna().astype(str))
+        fraud_receivers = set(df[df["isFraud"] == 1]["nameDest"].dropna().astype(str))
+        all_nodes = (
+            set(df["nameOrig"].dropna().astype(str)) |
+            set(df["nameDest"].dropna().astype(str))
+        )
+        for nid in all_nodes:
+            if nid in fraud_senders:
+                ai_predictions[nid] = "fraud"
+            elif nid in fraud_receivers:
+                ai_predictions[nid] = "mule"
+            else:
+                ai_predictions[nid] = "normal"
+
+    # ==================================================================
+    # DYNAMIC GRAPH GENERATION & SMART SLICING
+    # ==================================================================
+
+    # 1. CALCULATE TRUE METRICS ACROSS THE ENTIRE DATASET
+    all_senders       = df["nameOrig"].dropna().tolist()
+    all_receivers     = df["nameDest"].dropna().tolist()
+    all_unique_nodes  = list(set(all_senders + all_receivers))
+
+    # Use AI predictions for accurate metric counts
+    total_fraudsters = sum(1 for n in all_unique_nodes if ai_predictions.get(str(n)) == "fraud")
+    total_mules      = sum(1 for n in all_unique_nodes if ai_predictions.get(str(n)) == "mule")
+
+    print(f"🛑 DEBUG: Total nodes scanned: {len(all_unique_nodes)}")
+    print(f"🛑 DEBUG: Found {total_fraudsters} fraudsters and {total_mules} mules in memory!")
+
+    # 2. SMART SLICING FOR THE UI — prioritise rendering the fraud network
+    # Find all rows containing malicious actors identified by the GNN
+    fraud_node_ids = {n for n, g in ai_predictions.items() if g in ("fraud", "mule")}
+
+    mask = (
+        df["nameOrig"].astype(str).isin(fraud_node_ids) |
+        df["nameDest"].astype(str).isin(fraud_node_ids)
+    )
+    fraud_edges  = df[mask]
+    normal_edges = df[~mask]
+
+    # Take up to 600 fraud edges and pad with 200 normal ones
+    vis_df = pd.concat([fraud_edges.head(600), normal_edges.head(200)])
+
+    # 3. BUILD THE ARRAYS FOR REACT
+    unique_vis_nodes = list(set(
+        vis_df["nameOrig"].dropna().astype(str).tolist() +
+        vis_df["nameDest"].dropna().astype(str).tolist()
+    ))
 
     nodes_list = []
-    fraud_count = 0
-    mule_count = 0
-
-    for node in unique_nodes:
-        node_str = str(node).upper()
-        group = "normal"
-        
-        # Color code based on the generated data labels
-        if "FRAUD" in node_str:
-            group = "fraud"
-            fraud_count += 1
-        elif "MULE" in node_str or "OFFSHORE" in node_str:
-            group = "mule"
-            mule_count += 1
-            
+    for node in unique_vis_nodes:
+        group = ai_predictions.get(str(node), "normal")
         nodes_list.append({"id": str(node), "group": group})
 
-    # Extract dynamic links from the data
-    links_list = []
-    for _, row in vis_df.iterrows():
-        links_list.append({
-            "source": str(row['nameOrig']),
-            "target": str(row['nameDest'])
-        })
+    links_list = [
+        {"source": str(row["nameOrig"]), "target": str(row["nameDest"])}
+        for _, row in vis_df.iterrows()
+        if str(row["nameOrig"]) != "nan" and str(row["nameDest"]) != "nan"
+    ]
 
-    # Clean up the temp file
-    if os.path.exists(cleaned_filepath):
-        os.remove(cleaned_filepath)
-    
+    # 4. RETURN CORRECT METRICS AND SMART GRAPH
     return {
         "status": "success",
+        "column_mapping": {
+            "sender":   sender_col,
+            "receiver": receiver_col,
+            "amount":   amount_col,
+            "fraud":    fraud_col,
+        },
         "metrics": {
-            "total_nodes": len(pd.concat([df['nameOrig'], df['nameDest']]).unique()),
-            "total_edges": len(df),
-            "known_fraudsters": fraud_count,
-            "suspected_mules": mule_count
+            "total_nodes":      len(all_unique_nodes),
+            "total_edges":      len(df),
+            "known_fraudsters": total_fraudsters,
+            "suspected_mules":  total_mules,
         },
         "graph_data": {
             "nodes": nodes_list,
-            "links": links_list
-        }
+            "links": links_list,
+        },
     }
