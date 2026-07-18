@@ -3,7 +3,7 @@ import { Shield, Users, AlertTriangle, Search, Loader2, Upload, FileText } from 
 import AnoAI from './AnoAI'
 import FraudNetworkGraph from './FraudNetworkGraph'
 
-const API = 'http://localhost:8001'
+const API = 'http://localhost:8000'
 
 function fmt(n) {
   return typeof n === 'number' ? n.toLocaleString() : n
