@@ -1,4 +1,4 @@
-# Fraud Ring Detection using Graph Neural Networks, Anomaly Detection and Graph Analytics
+#  FRECTION - Fraud Ring Detection using Graph Neural Networks, Anomaly Detection and Graph Analytics
 
 ## Overview
 
