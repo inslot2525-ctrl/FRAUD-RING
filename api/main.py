@@ -423,11 +423,13 @@ async def analyze_dataset(file: UploadFile = File(...)):
         group = ai_predictions.get(str(node), "normal")
         nodes_list.append({"id": str(node), "group": group})
 
-    links_list = [
-        {"source": str(row["nameOrig"]), "target": str(row["nameDest"])}
-        for _, row in vis_df.iterrows()
-        if str(row["nameOrig"]) != "nan" and str(row["nameDest"]) != "nan"
-    ]
+    links_list = (
+        vis_df[["nameOrig", "nameDest"]]
+        .astype(str)
+        .query("nameOrig != 'nan' and nameDest != 'nan'")
+        .rename(columns={"nameOrig": "source", "nameDest": "target"})
+        .to_dict("records")
+    )
 
     # 4. RETURN CORRECT METRICS AND SMART GRAPH
     return {
