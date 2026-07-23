@@ -1,15 +1,15 @@
 """
 api/main.py
 -----------
-FastAPI backend for the Fraud Ring Detector.
+FastAPI backend for FRECTION — Fraud Ring Detection Engine.
 
 Endpoints
 ---------
-GET  /                          health check
+GET  /health                    health check
 GET  /api/stats                 pre-computed graph stats
 GET  /api/rings                 top fraud rings from clustering
 GET  /api/investigate/{account} lookup a specific account
-POST /api/analyze               upload CSV and return metrics + graph_data
+POST /api/analyze               upload CSV → returns metrics + graph_data
 """
 
 import io
@@ -48,7 +48,7 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Artifact cache
+# Artifact cache  (loaded once on first request)
 # ---------------------------------------------------------------------------
 _cache: dict = {}
 
@@ -105,96 +105,89 @@ def get_artifacts():
 # Routes
 # ---------------------------------------------------------------------------
 
-@app.get("/")
+@app.get("/health")
 def health_check():
-    return {"status": "GNN Engine online"}
+    return {"status": "Frection API online"}
 
 
 @app.get("/api/stats")
 def get_stats():
-    arts  = get_artifacts()
-    stats = arts["stats"]
-    sorted_clusters = sorted(
-        arts["cluster_fraud_counts"].items(), key=lambda x: x[1], reverse=True
-    )[:20]
-    suspected_mules = sum(
-        len(arts["cluster_members"][cid]) - fc for cid, fc in sorted_clusters
-    )
-    return {
-        "total_nodes":      stats["num_nodes"],
-        "total_edges":      stats["num_edges"],
-        "known_fraudsters": len(arts["known_fraud_set"]),
-        "suspected_mules":  int(suspected_mules),
-    }
+    try:
+        arts = get_artifacts()
+        return arts["stats"]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/rings")
 def get_rings(top_n: int = 10):
-    arts = get_artifacts()
-    sorted_clusters = sorted(
-        arts["cluster_fraud_counts"].items(), key=lambda x: x[1], reverse=True
-    )[:top_n]
-    rings = []
-    for rank, (cid, fraud_count) in enumerate(sorted_clusters, start=1):
-        members     = arts["cluster_members"][cid]
-        non_fraud   = [n for n in members if n not in arts["known_fraud_set"]]
-        top_targets = [arts["idx_to_node"][n] for n in non_fraud[:3]]
-        rings.append({
-            "rank":             rank,
-            "cluster_id":       cid,
-            "total_accounts":   len(members),
-            "known_fraudsters": fraud_count,
-            "suspected_mules":  len(members) - fraud_count,
-            "top_targets":      top_targets,
-        })
-    return {"rings": rings}
+    try:
+        arts                 = get_artifacts()
+        cluster_fraud_counts = arts["cluster_fraud_counts"]
+        cluster_members      = arts["cluster_members"]
+        idx_to_node          = arts["idx_to_node"]
+        known_fraud_set      = arts["known_fraud_set"]
+
+        sorted_clusters = sorted(cluster_fraud_counts.items(), key=lambda x: x[1], reverse=True)
+        rings = []
+        for cid, fraud_count in sorted_clusters[:top_n]:
+            members     = cluster_members[cid]
+            suspects    = [idx_to_node[n] for n in members if n not in known_fraud_set][:5]
+            rings.append({
+                "cluster_id":    cid,
+                "total_members": len(members),
+                "fraud_count":   fraud_count,
+                "suspects":      suspects,
+            })
+        return {"rings": rings}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/investigate/{account_id}")
 def investigate_account(account_id: str):
-    arts = get_artifacts()
-    if account_id not in arts["node_to_idx"]:
-        raise HTTPException(status_code=404, detail=f"Account '{account_id}' not found.")
+    try:
+        arts        = get_artifacts()
+        node_to_idx = arts["node_to_idx"]
+        if account_id not in node_to_idx:
+            return {"account": account_id, "status": "unknown", "message": "Not found in training graph."}
 
-    node_idx         = arts["node_to_idx"][account_id]
-    cid              = int(arts["cluster_labels"][node_idx])
-    members          = arts["cluster_members"][cid]
-    fraud_in_cluster = arts["cluster_fraud_counts"].get(cid, 0)
-    fraud_ratio      = fraud_in_cluster / max(len(members), 1)
-    is_known_fraud   = node_idx in arts["known_fraud_set"]
+        node_idx             = node_to_idx[account_id]
+        cluster_labels       = arts["cluster_labels"]
+        cluster_fraud_counts = arts["cluster_fraud_counts"]
+        cluster_members      = arts["cluster_members"]
+        known_fraud_set      = arts["known_fraud_set"]
 
-    if is_known_fraud:        risk = "CONFIRMED FRAUD"
-    elif fraud_ratio > 0.5:   risk = "CRITICAL RISK"
-    elif fraud_ratio > 0.1:   risk = "HIGH RISK"
-    elif fraud_ratio > 0.01:  risk = "MEDIUM RISK"
-    else:                     risk = "LOW RISK"
+        cid         = int(cluster_labels[node_idx])
+        fraud_ratio = cluster_fraud_counts.get(cid, 0) / max(len(cluster_members[cid]), 1)
+        is_fraud    = node_idx in known_fraud_set
 
-    return {
-        "account_id":         account_id,
-        "cluster_id":         cid,
-        "cluster_size":       len(members),
-        "fraud_in_cluster":   fraud_in_cluster,
-        "fraud_ratio":        round(fraud_ratio, 4),
-        "is_known_fraudster": is_known_fraud,
-        "risk_level":         risk,
-        "description": (
-            f"Account {account_id} is in cluster {cid} with {len(members):,} accounts, "
-            f"{fraud_in_cluster:,} confirmed fraudsters ({fraud_ratio*100:.1f}% fraud density)."
-        ),
-    }
+        return {
+            "account":     account_id,
+            "cluster_id":  cid,
+            "is_fraud":    is_fraud,
+            "fraud_ratio": round(fraud_ratio, 4),
+            "risk":        "high" if is_fraud or fraud_ratio > 0.3 else "medium" if fraud_ratio > 0.1 else "low",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+# ---------------------------------------------------------------------------
+# Main analyze endpoint
+# ---------------------------------------------------------------------------
 
 @app.post("/api/analyze")
 async def analyze_dataset(file: UploadFile = File(...)):
     """
     Accept ANY transaction CSV.
-    Automatically detects sender, receiver, amount, and fraud columns
-    by fuzzy-matching common naming patterns — no exact column names required.
+    Auto-detects sender/receiver/amount/fraud columns by fuzzy matching.
+    Returns metrics + graph_data for the React dashboard.
     """
     if not file.filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Please upload a .csv file.")
 
-    import pandas as pd  # noqa: PLC0415 — lazy import avoids DLL block on restricted machines
+    import pandas as pd
 
     contents = await file.read()
     try:
@@ -206,44 +199,31 @@ async def analyze_dataset(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="CSV appears empty or has too few columns.")
 
     # ------------------------------------------------------------------
-    # Smart column inference — case-insensitive pattern matching
+    # Smart column inference
     # ------------------------------------------------------------------
-    cols_lower = {c.lower().strip(): c for c in df.columns}  # lowercase → original
+    cols_lower = {c.lower().strip(): c for c in df.columns}
 
-    def find_col(patterns: list[str], exclude: set[str] = set()) -> str | None:
+    def find_col(patterns, exclude=set()):
         for pat in patterns:
             for lc, orig in cols_lower.items():
                 if pat in lc and orig not in exclude:
                     return orig
         return None
 
-    used: set[str] = set()
+    used = set()
 
-    sender_col = find_col([
-        "nameorig", "sender", "source", "from", "payer",
-        "originator", "src", "acct_from", "account_from", "origin"
-    ])
+    sender_col = find_col(["nameorig","sender","source","from","payer","originator","src","acct_from","account_from","origin"])
     if sender_col: used.add(sender_col)
 
-    receiver_col = find_col([
-        "namedest", "receiver", "dest", "target", "to", "payee",
-        "beneficiary", "dst", "acct_to", "account_to", "destination"
-    ], exclude=used)
+    receiver_col = find_col(["namedest","receiver","dest","target","to","payee","beneficiary","dst","acct_to","account_to","destination"], exclude=used)
     if receiver_col: used.add(receiver_col)
 
-    amount_col = find_col([
-        "amount", "amt", "value", "sum", "transaction_amount",
-        "trans_amount", "money", "price", "total"
-    ], exclude=used)
+    amount_col = find_col(["amount","amt","value","sum","transaction_amount","trans_amount","money","price","total"], exclude=used)
     if amount_col: used.add(amount_col)
 
-    fraud_col = find_col([
-        "isfraud", "is_fraud", "fraud", "fraudulent", "label",
-        "class", "target", "flag", "suspicious"
-    ], exclude=used)
+    fraud_col = find_col(["isfraud","is_fraud","fraud","fraudulent","label","class","flag","suspicious"], exclude=used)
 
-    # Last resort: if sender/receiver still missing, use the two object columns
-    # with the highest cardinality (most unique values → likely account IDs)
+    # Last resort: highest-cardinality object columns
     if not sender_col or not receiver_col:
         str_cols = df.select_dtypes(include="object").columns.tolist()
         ranked   = sorted(str_cols, key=lambda c: df[c].nunique(), reverse=True)
@@ -255,103 +235,70 @@ async def analyze_dataset(file: UploadFile = File(...)):
     if not sender_col or not receiver_col:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Could not detect sender/receiver columns from: {list(df.columns)}. "
-                "Ensure your CSV contains account ID columns."
-            ),
+            detail=f"Could not detect sender/receiver columns from: {list(df.columns)}."
         )
 
     has_fraud = fraud_col is not None and fraud_col in df.columns
-    print(f"Inferred → sender: '{sender_col}' | receiver: '{receiver_col}' | "
-          f"amount: '{amount_col}' | fraud: '{fraud_col}'")
+    print(f"Columns → sender:'{sender_col}' receiver:'{receiver_col}' amount:'{amount_col}' fraud:'{fraud_col}'")
 
-    # Rename to internal standard names
-    rename_map: dict[str, str] = {sender_col: "nameOrig", receiver_col: "nameDest"}
+    rename_map = {sender_col: "nameOrig", receiver_col: "nameDest"}
     if amount_col: rename_map[amount_col] = "amount"
     if has_fraud:  rename_map[fraud_col]  = "isFraud"
     df = df.rename(columns=rename_map)
     if not has_fraud:
-        df["isFraud"] = 0  # no fraud labels — treat all as unlabelled
+        df["isFraud"] = 0
 
-    # ==================================================================
-    # PYTORCH / GNN EXECUTION
-    # ==================================================================
-    # Derive predictions from the pre-loaded GNN artifacts where possible.
-    # Falls back to the CSV isFraud column if artifacts aren't loaded yet.
+    # ------------------------------------------------------------------
+    # Node classification  (structural + GNN)
+    # ------------------------------------------------------------------
     ai_predictions: dict[str, str] = {}
 
-    # --- collect CSV node sets ---------------------------------------------------
     all_csv_nodes   = set(df["nameOrig"].dropna().astype(str)) | set(df["nameDest"].dropna().astype(str))
     fraud_senders   = set(df[df["isFraud"] == 1]["nameOrig"].dropna().astype(str))
     fraud_receivers = set(df[df["isFraud"] == 1]["nameDest"].dropna().astype(str))
 
-    # ------------------------------------------------------------------
-    # STRUCTURAL / BEHAVIOURAL GRAPH ANALYSIS
-    # Detect fraud rings even when node names are opaque (e.g. F3001)
-    # ------------------------------------------------------------------
     src = df["nameOrig"].dropna().astype(str)
     dst = df["nameDest"].dropna().astype(str)
 
-    # How many distinct senders does each node receive from?
     in_degree_unique  = df.groupby("nameDest")["nameOrig"].nunique().to_dict()
-    # How many distinct receivers does each node send to?
     out_degree_unique = df.groupby("nameOrig")["nameDest"].nunique().to_dict()
-    # Total outgoing amount per node
-    if "amount" in df.columns:
-        out_amount = df.groupby("nameOrig")["amount"].sum().to_dict()
-    else:
-        out_amount = {}
 
-    total_nodes = max(len(all_csv_nodes), 1)
+    total_nodes          = max(len(all_csv_nodes), 1)
+    mule_fan_in_thresh   = max(2, total_nodes * 0.005)
 
-    # Thresholds — scale with dataset size so tiny CSVs still work
-    mule_fan_in_thresh  = max(2, total_nodes * 0.005)   # receives from ≥0.5% of nodes
-    fraud_fan_out_thresh = max(2, total_nodes * 0.003)  # sends to ≥0.3% of nodes
-
-    structural_mules  : set[str] = set()
-    structural_frauds : set[str] = set()
+    structural_mules:  set[str] = set()
+    structural_frauds: set[str] = set()
 
     for nid in all_csv_nodes:
         nu = nid.upper()
-        # Name-based — highest confidence
         if "FRAUD" in nu:
             structural_frauds.add(nid); continue
         if "MULE" in nu or "OFFSHORE" in nu or "SHELL" in nu:
             structural_mules.add(nid); continue
-        # isFraud column labels
         if nid in fraud_senders:
             structural_frauds.add(nid); continue
         if nid in fraud_receivers:
             structural_mules.add(nid); continue
-
         fan_in  = in_degree_unique.get(nid, 0)
         fan_out = out_degree_unique.get(nid, 0)
-
-        # Mule hub pattern: many senders → this node → few destinations
         if fan_in >= mule_fan_in_thresh and fan_out <= 3:
             structural_mules.add(nid)
-        # Fraud actor pattern: sends to a mule hub (resolved in second pass)
 
-    # Second pass — nodes that send directly to a structural mule are fraud actors
-    mule_receivers = set(dst[src.isin(structural_mules)])   # who receives FROM mules? (offshore)
-    structural_mules |= mule_receivers                      # those are also mules (layering)
+    # Cascade: who does the mule send to → also mule
+    mule_receivers = set(dst[src.isin(structural_mules)])
+    structural_mules |= mule_receivers
 
-    fraud_feeders = set(src[dst.isin(structural_mules)])    # who sends TO a mule?
+    # Cascade: who sends to a mule → fraud actor
+    fraud_feeders = set(src[dst.isin(structural_mules)])
     for nid in fraud_feeders:
         if nid not in structural_mules:
             structural_frauds.add(nid)
 
-    print(f"🔍 Structural analysis → {len(structural_frauds)} fraud actors, "
-          f"{len(structural_mules)} mule/offshore nodes detected.")
+    print(f"🔍 Structural → {len(structural_frauds)} fraud actors, {len(structural_mules)} mules")
 
-    # ------------------------------------------------------------------
-    # Helper that combines name + structural signals
-    # ------------------------------------------------------------------
     def classify_node(nid: str) -> str:
-        if nid in structural_frauds:
-            return "fraud"
-        if nid in structural_mules:
-            return "mule"
+        if nid in structural_frauds: return "fraud"
+        if nid in structural_mules:  return "mule"
         return "normal"
 
     try:
@@ -370,59 +317,46 @@ async def analyze_dataset(file: UploadFile = File(...)):
                 fraud_ratio = cluster_fraud_counts.get(cid, 0) / max(len(cluster_members[cid]), 1)
                 ai_predictions[account_id] = "mule" if fraud_ratio > 0.1 else "normal"
 
-        # For CSV nodes not covered by the pre-trained GNN mapping,
-        # use structural + name-based classification.
+        # For CSV nodes not in the pre-trained mapping, use structural analysis
         gnn_covered = set(node_to_idx.keys())
         for nid in all_csv_nodes:
             if nid not in gnn_covered:
                 ai_predictions[nid] = classify_node(nid)
 
     except Exception as exc:
-        print(f"⚠️  GNN artifacts unavailable ({exc}), using structural analysis.")
+        print(f"⚠️  GNN artifacts unavailable ({exc}), using structural analysis only.")
         for nid in all_csv_nodes:
             ai_predictions[nid] = classify_node(nid)
 
-    # ==================================================================
-    # DYNAMIC GRAPH GENERATION & SMART SLICING
-    # ==================================================================
+    # ------------------------------------------------------------------
+    # Metrics & smart graph slicing
+    # ------------------------------------------------------------------
+    all_unique_nodes = list(all_csv_nodes)
 
-    # 1. CALCULATE TRUE METRICS ACROSS THE ENTIRE DATASET
-    all_senders       = df["nameOrig"].dropna().tolist()
-    all_receivers     = df["nameDest"].dropna().tolist()
-    all_unique_nodes  = list(set(all_senders + all_receivers))
+    total_fraudsters = sum(1 for n in all_unique_nodes if ai_predictions.get(n) == "fraud")
+    total_mules      = sum(1 for n in all_unique_nodes if ai_predictions.get(n) == "mule")
 
-    # Use AI predictions for accurate metric counts
-    total_fraudsters = sum(1 for n in all_unique_nodes if ai_predictions.get(str(n)) == "fraud")
-    total_mules      = sum(1 for n in all_unique_nodes if ai_predictions.get(str(n)) == "mule")
+    print(f"🛑 DEBUG: Total nodes: {len(all_unique_nodes)} | Fraudsters: {total_fraudsters} | Mules: {total_mules}")
 
-    print(f"🛑 DEBUG: Total nodes scanned: {len(all_unique_nodes)}")
-    print(f"🛑 DEBUG: Found {total_fraudsters} fraudsters and {total_mules} mules in memory!")
-
-    # 2. SMART SLICING FOR THE UI — prioritise rendering the fraud network
-    # Find all rows containing malicious actors identified by the GNN
     fraud_node_ids = {n for n, g in ai_predictions.items() if g in ("fraud", "mule")}
 
-    mask = (
-        df["nameOrig"].astype(str).isin(fraud_node_ids) |
-        df["nameDest"].astype(str).isin(fraud_node_ids)
-    )
+    mask         = df["nameOrig"].astype(str).isin(fraud_node_ids) | df["nameDest"].astype(str).isin(fraud_node_ids)
     fraud_edges  = df[mask]
     normal_edges = df[~mask]
 
-    # Take up to 600 fraud edges and pad with 200 normal ones
     vis_df = pd.concat([fraud_edges.head(600), normal_edges.head(200)])
 
-    # 3. BUILD THE ARRAYS FOR REACT
     unique_vis_nodes = list(set(
         vis_df["nameOrig"].dropna().astype(str).tolist() +
         vis_df["nameDest"].dropna().astype(str).tolist()
     ))
 
-    nodes_list = []
-    for node in unique_vis_nodes:
-        group = ai_predictions.get(str(node), "normal")
-        nodes_list.append({"id": str(node), "group": group})
+    nodes_list = [
+        {"id": n, "group": ai_predictions.get(n, "normal")}
+        for n in unique_vis_nodes
+    ]
 
+    # Fast vectorised links (no iterrows)
     links_list = (
         vis_df[["nameOrig", "nameDest"]]
         .astype(str)
@@ -431,7 +365,6 @@ async def analyze_dataset(file: UploadFile = File(...)):
         .to_dict("records")
     )
 
-    # 4. RETURN CORRECT METRICS AND SMART GRAPH
     return {
         "status": "success",
         "column_mapping": {

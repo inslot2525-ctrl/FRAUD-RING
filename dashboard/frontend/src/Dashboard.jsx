@@ -30,6 +30,7 @@ export default function Dashboard() {
   const navigate = useNavigate()
   const [file, setFile] = useState(null)
   const [uploading, setUploading] = useState(false)
+  const [statusMessage, setStatusMessage] = useState('') // New state for live PyTorch logs
   const [stats, setStats] = useState(null)
   const [graphData, setGraphData] = useState(null)
   const [error, setError] = useState(null)
@@ -48,6 +49,7 @@ export default function Dashboard() {
     if (!file) return
 
     setUploading(true)
+    setStatusMessage('Running GNN analysis...')
     setError(null)
     setStats(null)
     setGraphData(null)
@@ -67,9 +69,9 @@ export default function Dashboard() {
       }
 
       const data = await res.json()
-      // Populate dashboard state with the backend GNN output
       setStats(data.metrics)
       setGraphData(data.graph_data)
+      setStatusMessage('')
     } catch (err) {
       setError(err.message || 'Cannot reach the GNN backend server.')
     } finally {
@@ -115,13 +117,15 @@ export default function Dashboard() {
         {/* Upload Box Component */}
         <div className="bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
           <h2 className="text-xl font-medium mb-2">1. Upload Transaction Dataset</h2>
-          <p className="text-gray-400 text-xs mb-4">Select your bank ledger CSV format containing sender/receiver mappings to run through the Graph Neural Network.</p>
-          
+          <p className="text-gray-400 text-xs mb-4">
+            Select your bank ledger CSV format containing sender/receiver mappings to run through the Graph Neural Network.
+          </p>
+
           <form onSubmit={handleUploadSubmit} className="flex flex-col md:flex-row items-stretch md:items-center gap-4">
             <div className="flex-1 relative border border-dashed border-white/20 hover:border-cyan-400/50 rounded-xl p-4 flex items-center justify-center bg-black/30 transition-all cursor-pointer">
-              <input 
-                type="file" 
-                accept=".csv" 
+              <input
+                type="file"
+                accept=".csv"
                 onChange={handleFileChange}
                 className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
               />
@@ -130,7 +134,7 @@ export default function Dashboard() {
                 <span>{file ? file.name : 'Choose transaction_ledger.csv...'}</span>
               </div>
             </div>
-            
+
             <button
               type="submit"
               disabled={!file || uploading}
@@ -139,7 +143,7 @@ export default function Dashboard() {
               {uploading ? (
                 <>
                   <Loader2 size={16} className="animate-spin" />
-                  Running GNN Analysis...
+                  Processing...
                 </>
               ) : (
                 'Execute Fraud Detection'
@@ -150,21 +154,21 @@ export default function Dashboard() {
 
         {/* Global Network Analytics Summary */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
-          <MetricCard title="Total Accounts Scanned" value={stats?.total_nodes} icon={<Users size={20}/>} loading={uploading} />
-          <MetricCard title="Transactions Processed" value={stats?.total_edges} icon={<AlertTriangle size={20}/>} loading={uploading} />
-          <MetricCard title="Known Malicious Hubs" value={stats?.known_fraudsters} icon={<Shield size={20}/>} loading={uploading} color="text-red-400" />
-          <MetricCard title="Newly Identified Mules" value={stats?.suspected_mules} icon={<Search size={20}/>} loading={uploading} color="text-cyan-400" />
+          <MetricCard title="Total Accounts Scanned" value={stats?.total_nodes} icon={<Users size={20} />} loading={uploading} />
+          <MetricCard title="Transactions Processed" value={stats?.total_edges} icon={<AlertTriangle size={20} />} loading={uploading} />
+          <MetricCard title="Known Malicious Hubs" value={stats?.known_fraudsters} icon={<Shield size={20} />} loading={uploading} color="text-red-400" />
+          <MetricCard title="Newly Identified Mules" value={stats?.suspected_mules} icon={<Search size={20} />} loading={uploading} color="text-cyan-400" />
         </div>
 
         {/* Main Graph Dynamic Container */}
         <div className="bg-white/5 border border-white/10 backdrop-blur-md rounded-2xl p-6">
           <h2 className="text-xl font-medium mb-1">2. Network Topology & Risk Clusters</h2>
           <p className="text-gray-400 text-xs mb-4">
-            {graphData 
-              ? 'Interactive WebGL visualization generated from GNN node embeddings.' 
+            {graphData
+              ? 'Interactive WebGL visualization generated from GNN node embeddings.'
               : 'Graph network structure will automatically generate here once a dataset has completed scanning.'}
           </p>
-          
+
           <div className="rounded-xl overflow-hidden bg-black/40 border border-white/5 flex items-center justify-center min-h-[400px]">
             {graphData ? (
               <FraudNetworkGraph graphData={graphData} />
@@ -172,8 +176,8 @@ export default function Dashboard() {
               <div className="text-center p-8 space-y-2">
                 {uploading ? (
                   <>
-                    <Loader2 size={36} className="animate-spin mx-auto text-cyan-400" />
-                    <p className="text-sm text-gray-400">Constructing topological graph matrix...</p>
+                    <Loader2 size={36} className="animate-spin mx-auto text-cyan-400 mb-2" />
+                    <p className="text-sm font-mono text-cyan-300">{statusMessage || 'Constructing topological graph matrix...'}</p>
                   </>
                 ) : (
                   <>
